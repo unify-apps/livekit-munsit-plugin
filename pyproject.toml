@@ -1,0 +1,49 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "livekit-plugins-munsit"
+version = "1.0.0"
+description = "LiveKit Agents plugin for Munsit (Faseeh) Arabic TTS and STT"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+
+authors = [
+    { name = "Swayam Hingu" }
+]
+
+keywords = [
+    "livekit",
+    "munsit",
+    "faseeh",
+    "arabic",
+    "tts",
+    "stt",
+    "speech",
+    "voice",
+    "audio"
+]
+
+classifiers = [
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3 :: Only",
+]
+
+# aiohttp, av (wav decoding) and livekit-blingfire (the default sentence
+# tokenizer) are all base deps of livekit-agents, so nothing else is needed
+dependencies = [
+    "livekit-agents>=1.8.2",
+]
+
+[project.urls]
+Repository = "https://github.com/Swayam-Hingu-PE/livekit-munsit-plugin"
+
+[tool.hatch.build.targets.wheel]
+packages = ["livekit"]
+
+[tool.hatch.build.targets.sdist]
+include = ["/livekit"]
