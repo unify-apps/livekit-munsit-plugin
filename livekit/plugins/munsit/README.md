@@ -11,7 +11,7 @@ repo + `requirements.txt` entry later, so it depends on nothing outside `livekit
 ## Usage
 
 ```python
-import munsit
+from livekit.plugins import munsit
 
 tts = munsit.TTS(
     voice_id="ar-najdi-male-2",   # from GET /voices
@@ -47,18 +47,16 @@ Through the agent config (`get_tts`):
 
 Munsit has one endpoint — `POST /text-to-speech/{model_id}` — and a `streaming` flag on the body.
 
-| | request | response | used by |
+| | capability | request | response |
 |---|---|---|---|
-| `streaming=False` | one request for the whole text | complete `audio/wav` | `synthesize()` |
-| `streaming=True` | one request per sentence | chunked raw PCM16 mono | `stream()`, and `synthesize()` reads the body as it arrives |
+| `streaming=True` (default) | streaming + aligned transcript: the session drives `stream()` | one request per sentence | chunked raw PCM16 mono |
+| `streaming=False` | the session wraps `synthesize()` in `tts.StreamAdapter` | one request per sentence | complete `audio/wav` |
 
-`streaming` on the constructor sets `TTSCapabilities.streaming`, which is what decides whether the
-agent session drives `stream()` or wraps `synthesize()` in a `StreamAdapter`.
-
-Munsit's streaming endpoint takes no incremental text input, so `SynthesizeStream` tokenizes the
-incoming text into sentences (blingfire by default) and issues one chunked request per sentence,
-in order, pushing every chunk into a single audio segment. `stream()` always asks for chunks even
-when `streaming=False`, because concatenated WAV headers mid-segment would not decode.
+The endpoint takes no incremental text input, so `SynthesizeStream` works like the framework's
+`StreamAdapter`: it tokenizes the LLM output into sentences (the `tokenizer` argument, blingfire
+by default), sends one chunked request per sentence, in order, and stamps each sentence's text
+with the time its audio starts. Audio arrives faster than it plays, so the next request usually
+starts while the previous sentence is still playing and its time-to-first-byte is not heard.
 
 Lower `min_sentence_len` on the tokenizer to cut first-audio latency; blingfire's default of 20
 **characters** groups short Arabic sentences into one request.
@@ -75,7 +73,7 @@ Lower `min_sentence_len` on the tokenizer to cut first-audio latency; blingfire'
 ## Usage
 
 ```python
-import munsit
+from livekit.plugins import munsit
 
 stt = munsit.STT(
     model="munsit",            # or "munsit-en-ar" for Arabic/English code-switching
@@ -132,7 +130,8 @@ Event mapping on the socket:
 | `Results` `is_final:false` | `INTERIM_TRANSCRIPT` |
 | `Results` `is_final:true` | `FINAL_TRANSCRIPT` (+ `END_OF_SPEECH` when `speech_final`) |
 | `UtteranceEnd` | `END_OF_SPEECH` |
-| `Error` `recoverable:false` | `APIStatusError` → reconnect |
+| `Error` `recoverable:false` | `APIError` → reconnect (code `4002` fails fast) |
+| `Error` `recoverable:true` | warning log |
 | `Metadata` / `Gender` / `Sentiment` | debug log only |
 
 `is_final: true` with `speech_final: false` is a forced split during long speech (~60s), not a turn
@@ -141,16 +140,17 @@ transcript, so there is no event left to attach them to — they are logged at d
 
 A `KeepAlive` goes out every 5s (the socket closes with `1011` after 12s without audio) and the
 connection carries a 30s heartbeat so a half-open socket triggers a reconnect instead of hanging.
-Close code `1008` (auth / session limit / no balance) is mapped to a non-retryable error; the rest
-reconnect.
+Close codes `1008` (auth / session limit / no balance) and `4002` (invalid connection parameters)
+map to a non-retryable error; the rest reconnect.
+
+Audio always goes out as `linear16` mono, which is what LiveKit hands the stream. `encoding` and
+`num_channels` are accepted for configs that spell them out, but only as `"linear16"` and `1` —
+Munsit's `mulaw` / `alaw` would mislabel PCM16 bytes, so any other value raises.
 
 # Test
 
-Both drive the real plugin against a local stand-in for the API — no key and no network needed:
+Drives the real plugin against a local stand-in for the API — no key and no network needed:
 
 ```bash
-venv/bin/python munsit_test.py       # TTS: both modes + error path
-venv/bin/python munsit_stt_test.py   # STT: transcribe + websocket event sequence
+pip install -e . && python tests/test_munsit.py
 ```
-
-`munsit_try.py` runs the TTS against the live API and writes a wav.

@@ -19,6 +19,7 @@ from livekit.agents import (
 )
 from livekit.agents.types import DEFAULT_API_CONNECT_OPTIONS, NOT_GIVEN, NotGivenOr
 from livekit.agents.utils import is_given
+from livekit.agents.voice.io import TimedString
 
 from .log import logger
 from .models import TTSDialects, TTSModels
@@ -101,7 +102,7 @@ class _TTSOptions:
 
 
 async def _raise_for_status(res: aiohttp.ClientResponse, request_id: str) -> None:
-    if res.status == 200:
+    if 200 <= res.status < 300:
         return
 
     try:
@@ -155,7 +156,8 @@ class TTS(tts.TTS):
             api_key: Munsit API key, or `MUNSIT_API_KEY` in the environment.
             base_url: API root; defaults to `MUNSIT_BASE_URL` or the global endpoint.
                 Use `https://ae.api.faseeh.ai/api/v1` for UAE data residency.
-            tokenizer: Splits streamed text into sentences, one request each.
+            tokenizer: Splits streamed text into sentences, one request each. Defaults
+                to the one the framework's `StreamAdapter` uses.
             http_session: Session to reuse instead of the agent's shared one.
             ssl: Verify TLS certificates.
 
@@ -169,7 +171,8 @@ class TTS(tts.TTS):
         )
 
         super().__init__(
-            capabilities=tts.TTSCapabilities(streaming=streaming),
+            # aligned: each sentence's text is stamped with where its audio starts
+            capabilities=tts.TTSCapabilities(streaming=streaming, aligned_transcript=streaming),
             sample_rate=sample_rate,
             num_channels=NUM_CHANNELS,
         )
@@ -196,7 +199,9 @@ class TTS(tts.TTS):
             ssl=ssl,
         )
         self._sentence_tokenizer = (
-            tokenizer if is_given(tokenizer) else tokenize.blingfire.SentenceTokenizer()
+            tokenizer
+            if is_given(tokenizer)
+            else tokenize.blingfire.SentenceTokenizer(retain_format=True)
         )
         self._session = http_session
         self._streams = weakref.WeakSet[SynthesizeStream]()
@@ -248,13 +253,21 @@ class TTS(tts.TTS):
         return await self._get("/models")
 
     async def _get(self, path: str) -> list[dict[str, Any]]:
-        async with self._ensure_session().get(
-            f"{self._opts.base_url}{path}",
-            headers={AUTH_HEADER: self._opts.api_key},
-            ssl=self._opts.ssl,
-        ) as res:
-            await _raise_for_status(res, path)
-            return await res.json()
+        try:
+            async with self._ensure_session().get(
+                f"{self._opts.base_url}{path}",
+                headers={AUTH_HEADER: self._opts.api_key},
+                timeout=_timeout(DEFAULT_API_CONNECT_OPTIONS),
+                ssl=self._opts.ssl,
+            ) as res:
+                await _raise_for_status(res, path)
+                return await res.json()
+        except APIStatusError:
+            raise
+        except asyncio.TimeoutError:
+            raise APITimeoutError() from None
+        except Exception as e:
+            raise APIConnectionError() from e
 
     def synthesize(
         self, text: str, *, conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS
@@ -328,9 +341,12 @@ class SynthesizeStream(tts.SynthesizeStream):
     """Incremental text in, audio out.
 
     Munsit's streaming endpoint is plain chunked HTTP with no incremental input, so
-    text is tokenized into sentences and each one is its own request, read as raw
-    PCM16 and pushed into the same segment. Requests are issued in order: the
-    emitter concatenates bytes, so overlapping them would interleave the audio.
+    this works like the framework's `StreamAdapter`: text is tokenized into
+    sentences, each one is its own request read as raw PCM16, and its text is
+    pushed as a timed transcript where its audio starts. Requests go one at a
+    time, in order: the emitter concatenates bytes, so overlapping them would
+    interleave the audio, and a stream never holds more than one of the account's
+    concurrent request slots.
     """
 
     def __init__(self, *, tts: TTS, conn_options: APIConnectOptions) -> None:
@@ -361,11 +377,14 @@ class SynthesizeStream(tts.SynthesizeStream):
             sent_stream.end_input()
 
         async def _synthesize() -> None:
+            duration = 0.0
             async for ev in sent_stream:
-                if not ev.token.strip():
+                # retain_format keeps whitespace for the transcript, not for Munsit
+                if not (text := ev.token.strip()):
                     continue
                 self._mark_started()
-                await self._synthesize_sentence(ev.token, request_id, output_emitter)
+                output_emitter.push_timed_transcript(TimedString(text=ev.token, start_time=duration))
+                duration += await self._synthesize_sentence(text, request_id, output_emitter)
 
         tasks = [
             asyncio.create_task(_tokenize_input()),
@@ -385,7 +404,9 @@ class SynthesizeStream(tts.SynthesizeStream):
 
     async def _synthesize_sentence(
         self, text: str, request_id: str, output_emitter: tts.AudioEmitter
-    ) -> None:
+    ) -> float:
+        """Stream one sentence's audio into the emitter; returns its duration in seconds."""
+        pushed = 0
         async with self._tts._ensure_session().post(
             self._opts.synthesize_url,
             headers=self._opts.headers,
@@ -398,3 +419,6 @@ class SynthesizeStream(tts.SynthesizeStream):
             logger.debug("munsit tts sentence started", extra={"request_id": request_id})
             async for data, _ in res.content.iter_chunks():
                 output_emitter.push(data)
+                pushed += len(data)
+
+        return pushed / (self._opts.sample_rate * NUM_CHANNELS * 2)  # PCM16
