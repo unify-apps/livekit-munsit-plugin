@@ -19,7 +19,7 @@ from livekit.agents import (
     tts,
     utils,
 )
-from livekit.agents.types import DEFAULT_API_CONNECT_OPTIONS, NOT_GIVEN, NotGivenOr
+from livekit.agents.types import DEFAULT_API_CONNECT_OPTIONS, NOT_GIVEN, NotGiven, NotGivenOr
 from livekit.agents.utils import is_given
 from livekit.agents.voice.io import TimedString
 
@@ -52,6 +52,30 @@ def _timeout(conn_options: APIConnectOptions) -> aiohttp.ClientTimeout:
     return aiohttp.ClientTimeout(
         total=REQUEST_TOTAL_TIMEOUT, sock_connect=conn_options.timeout
     )
+
+
+def _flag(value: Optional[bool], default: bool) -> bool:
+    """Resolve a config flag: `None` means the default."""
+    return default if value is None else bool(value)
+
+
+def _string(value: Optional[str], default: str) -> str:
+    """Resolve a config string: `None` or empty means the default."""
+    if not value:
+        return default
+    return value
+
+
+def _api_key(api_key: NotGivenOr[str]) -> str:
+    key = (api_key if is_given(api_key) else None) or os.environ.get("MUNSIT_API_KEY")
+    if not key:
+        raise ValueError("munsit: API key required. Set MUNSIT_API_KEY or pass api_key.")
+    return key
+
+
+def _base_url(base_url: NotGivenOr[str]) -> str:
+    url = base_url if is_given(base_url) and base_url else os.environ.get("MUNSIT_BASE_URL")
+    return (url or BASE_URL).rstrip("/")
 
 
 def _number(name: str, value: Any, default: float, bounds: tuple[float, float]) -> float:
@@ -119,6 +143,15 @@ async def _pcm_samples(res: aiohttp.ClientResponse) -> AsyncIterator[bytes]:
         logger.warning("munsit tts response ended mid-sample, dropped %d byte(s)", len(carry))
 
 
+def _emit_now(output_emitter: tts.AudioEmitter, data: bytes) -> None:
+    """Push PCM and flush it, so the emitter never holds audio back.
+
+    Audio held to fill a frame made playback run dry ~130 ms into replies (a tick + mute).
+    """
+    output_emitter.push(data)
+    output_emitter.flush()
+
+
 async def _raise_for_status(res: aiohttp.ClientResponse, request_id: str) -> None:
     if 200 <= res.status < 300:
         return
@@ -177,7 +210,7 @@ class TTS(tts.TTS):
 
         Every argument but `voice_id` also accepts `None`, meaning the default above.
         """
-        streaming = True if streaming is None else bool(streaming)
+        streaming = _flag(streaming, True)
         stability = _number("stability", stability, DEFAULT_STABILITY, STABILITY_RANGE)
         speed = _number("speed", speed, DEFAULT_SPEED, SPEED_RANGE)
         sample_rate = int(
@@ -191,24 +224,19 @@ class TTS(tts.TTS):
             num_channels=NUM_CHANNELS,
         )
 
-        munsit_api_key = (api_key if is_given(api_key) else None) or os.environ.get("MUNSIT_API_KEY")
-        if not munsit_api_key:
-            raise ValueError("munsit: API key required. Set MUNSIT_API_KEY or pass api_key.")
-
+        munsit_api_key = _api_key(api_key)
         if not voice_id:
             raise ValueError("munsit: voice_id is required, see https://api.munsit.com/api/v1/voices")
 
-        url = base_url if is_given(base_url) and base_url else os.environ.get("MUNSIT_BASE_URL")
-
         self._opts = _TTSOptions(
-            model=model or DEFAULT_MODEL,
+            model=_string(model, DEFAULT_MODEL),
             voice_id=voice_id,
             stability=stability,
             speed=speed,
             sample_rate=sample_rate,
-            dialect=dialect or DEFAULT_DIALECT,
+            dialect=_string(dialect, DEFAULT_DIALECT),
             streaming=streaming,
-            base_url=(url or BASE_URL).rstrip("/"),
+            base_url=_base_url(base_url),
             api_key=munsit_api_key,
             ssl=ssl,
         )
@@ -243,15 +271,16 @@ class TTS(tts.TTS):
         dialect: NotGivenOr[TTSDialects | str] = NOT_GIVEN,
     ) -> None:
         """Apply to requests made from here on; `sample_rate` and `streaming` are fixed."""
-        if is_given(voice_id):
+        # isinstance, not is_given: PyCharm doesn't narrow is_given() on Literal unions
+        if not isinstance(voice_id, NotGiven):
             self._opts.voice_id = voice_id
-        if is_given(model):
+        if not isinstance(model, NotGiven):
             self._opts.model = model
-        if is_given(stability):
+        if not isinstance(stability, NotGiven):
             self._opts.stability = _number("stability", stability, DEFAULT_STABILITY, STABILITY_RANGE)
-        if is_given(speed):
+        if not isinstance(speed, NotGiven):
             self._opts.speed = _number("speed", speed, DEFAULT_SPEED, SPEED_RANGE)
-        if is_given(dialect):
+        if not isinstance(dialect, NotGiven):
             self._opts.dialect = dialect
 
     async def list_voices(self) -> list[dict[str, Any]]:
@@ -292,7 +321,7 @@ class TTS(tts.TTS):
         return stream
 
     async def aclose(self) -> None:
-        for stream in list(self._streams):
+        for stream in self._streams.copy():  # a snapshot: aclose() awaits
             await stream.aclose()
         self._streams.clear()
         await super().aclose()
@@ -326,9 +355,12 @@ class ChunkedStream(tts.ChunkedStream):
                     mime_type="audio/pcm" if self._opts.streaming else "audio/wav",
                 )
 
-                body = _pcm_samples(res) if self._opts.streaming else res.content.iter_any()
-                async for data in body:
-                    output_emitter.push(data)
+                if self._opts.streaming:
+                    async for data in _pcm_samples(res):
+                        _emit_now(output_emitter, data)
+                else:
+                    async for data in res.content.iter_any():
+                        output_emitter.push(data)
 
                 output_emitter.flush()
         except APIStatusError:
@@ -389,8 +421,6 @@ class SynthesizeStream(tts.SynthesizeStream):
                 duration += await self._synthesize_sentence(
                     text, request_id, output_emitter, retry=duration > 0
                 )
-                # play this sentence's tail now, as Speechify and StreamAdapter do
-                output_emitter.flush()
 
         tasks = [
             asyncio.create_task(_tokenize_input()),
@@ -431,7 +461,7 @@ class SynthesizeStream(tts.SynthesizeStream):
 
                     logger.debug("munsit tts sentence started", extra={"request_id": request_id})
                     async for data in _pcm_samples(res):
-                        output_emitter.push(data)
+                        _emit_now(output_emitter, data)
                         pushed += len(data)
 
                 return pushed / (self._opts.sample_rate * BYTES_PER_SAMPLE)

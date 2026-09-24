@@ -239,8 +239,8 @@ async def test_tts_streaming(http):
 
 
 async def test_tts_pcm_stays_aligned(http):
-    """A chunk ending mid-sample, then a stall long enough for the emitter's slow-audio
-    flush (livekit/agents#7391), then a stray trailing byte: no later sample may shift.
+    """A chunk ending mid-sample (each chunk is flushed as it arrives, livekit/agents#7391),
+    then a stray trailing byte: no later sample may shift.
     """
 
     async def handler(req):
@@ -250,7 +250,7 @@ async def test_tts_pcm_stays_aligned(http):
         if i == 0:
             pcm = tone(0, 0.7)
             await res.write(pcm[:24001])  # 0.5s + half a sample
-            await asyncio.sleep(0.8)  # longer than the audio already sent
+            await asyncio.sleep(0.05)  # keep the two writes as separate reads
             await res.write(pcm[24001:] + b"\x00")
         else:
             await res.write(tone(i))
@@ -301,20 +301,73 @@ async def test_tts_sentence_retry(http):
         await runner.cleanup()
 
 
+async def test_tts_releases_audio_as_it_arrives(http):
+    """Playback must not run dry while received audio is still held back.
+
+    Munsit's measured timing (223 ms in 20 ms, then nothing until 147 ms) used to run dry
+    ~130 ms in: the tick and mute heard near each reply start. With a 100 ms burst and then
+    nothing until 300 ms, playback may only run dry once all 100 ms has played.
+    """
+    cases = {
+        "measured": ([(0, 138), (20, 85), (147, 226), (264, 258)], None),
+        "slow": ([(0, 100), (300, 200), (420, 200)], 0.095),
+    }
+    for name, (chunks, dry_not_before) in cases.items():
+
+        async def handler(req, chunks=chunks):
+            res = web.StreamResponse()
+            await res.prepare(req)
+            start = time.monotonic()
+            for at_ms, audio_ms in chunks:
+                await asyncio.sleep(max(0.0, at_ms / 1000 - (time.monotonic() - start)))
+                await res.write(np.full(24 * audio_ms, 1000, dtype=np.int16).tobytes())
+            return res
+
+        runner, url = await serve([web.post(TTS_PATH, handler)])
+        munsit_tts = munsit.TTS(api_key="x", voice_id="v", base_url=url, http_session=http)
+        for mode in ("stream", "synthesize"):
+            if mode == "stream":
+                stream = munsit_tts.stream()
+                stream.push_text(SENTENCES[0])
+                stream.end_input()
+            else:
+                stream = munsit_tts.synthesize(SENTENCES[0])
+            async with stream:
+                arrivals = [(time.monotonic(), ev.frame.duration) async for ev in stream]
+
+            start = played_until = arrivals[0][0]
+            dry_at = []
+            for at, duration in arrivals:
+                if at > played_until + 0.005:
+                    dry_at.append(played_until - start)
+                    played_until = at
+                played_until += duration
+            if dry_not_before is None:
+                assert not dry_at, (name, mode, dry_at)
+            else:
+                assert all(t >= dry_not_before for t in dry_at), (name, mode, dry_at)
+        await runner.cleanup()
+
+
 def test_constructor_validation():
-    munsit.STT(api_key="x", encoding="linear16", num_channels=1)  # configs spelling out defaults
+    # null config values mean the defaults
+    stt = munsit.STT(
+        api_key="x",
+        listen=munsit.ListenOptions(sample_rate=None, endpointing_ms=None, smart_turn=None),
+        transcribe=munsit.TranscribeOptions(return_timestamps=None),
+    )
+    assert (stt._opts.sample_rate, stt._opts.endpointing_ms, stt._opts.smart_turn) == (16000, 800, True)
+    assert stt._opts.return_timestamps is True
     for build in (
-        lambda: munsit.STT(api_key="x", endpointing_ms=50),
+        lambda: munsit.STT(api_key="x", listen=munsit.ListenOptions(endpointing_ms=50)),
+        lambda: munsit.STT(api_key="x", listen=munsit.ListenOptions(sample_rate=44100)),
         lambda: munsit.STT(api_key="x").update_options(endpointing_ms=6000),
-        lambda: munsit.STT(api_key="x", encoding="mulaw"),
-        lambda: munsit.STT(api_key="x", num_channels=2),
     ):
         try:
             build()
             raise AssertionError("expected ValueError")
         except ValueError:
             pass
-
 
 async def main():
     test_constructor_validation()
@@ -327,6 +380,7 @@ async def main():
             test_tts_streaming,
             test_tts_pcm_stays_aligned,
             test_tts_sentence_retry,
+            test_tts_releases_audio_as_it_arrives,
         ):
             await test(http)
             print("ok", test.__name__)

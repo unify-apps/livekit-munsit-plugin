@@ -55,6 +55,8 @@ it splits the LLM output into sentences (the `tokenizer` argument) and sends one
 per sentence, in order.
 
 - A sentence that fails after earlier ones have played is retried on its own (up to `max_retry`).
+- Audio is released to LiveKit as each chunk arrives, so a pause in Munsit's stream never holds
+  back audio already received (that caused a tick and short mute ~130 ms into replies).
 - PCM goes to LiveKit in whole samples; before livekit-agents 1.8.3 a half sample could turn the
   rest of a reply into static ([livekit/agents#7391](https://github.com/livekit/agents/pull/7391)).
 - Lower `min_sentence_len` to cut first-audio latency; blingfire's default of 20 **characters**
@@ -78,11 +80,13 @@ stt = munsit.STT(
     model="munsit",            # or "munsit-en-ar" for Arabic/English code-switching
     language="ar",             # only "ar" in v1
     streaming=True,
-    interim_results=True,
-    sample_rate=16000,         # 8000 or 16000
-    endpointing_ms=800,        # 100-5000 ms of silence that ends a turn
-    smart_turn=True,
     hotwords="عبد القادر,أديب",
+    listen=munsit.ListenOptions(
+        sample_rate=16000,     # 8000 or 16000
+        endpointing_ms=300,    # 100-5000 ms of silence that ends a turn
+        smart_turn=False,
+    ),
+    # streaming=False only: transcribe=munsit.TranscribeOptions(return_turns=True, ...)
 )
 ```
 
@@ -97,8 +101,8 @@ Through the agent config (`get_stt`):
   "streaming": true,
   "enable_interim_results": true,
   "sample_rate": 16000,
-  "endpointing": 800,
-  "smart_turn": true,
+  "endpointing": 300,
+  "smart_turn": false,
   "hotwords": "عبد القادر,أديب",
   "correlation_id": "call-8371",
   "metadata": { "room": "r1" }
@@ -106,8 +110,8 @@ Through the agent config (`get_stt`):
 ```
 
 `endpointing` and `enable_interim_results` reuse the config keys the other STT providers use.
-Transcribe-only extras: `return_confidence`, `return_timestamps`, `return_turns`,
-`return_gender`, `return_sentiment`.
+Transcribe-only extras (`return_confidence`, `return_timestamps`, `return_turns`,
+`return_gender`, `return_sentiment`) go into `TranscribeOptions`.
 
 When LiveKit's VAD decides the turn (`turn_detection="vad"`), set `smart_turn` off and
 `endpointing` low (~300): otherwise Munsit's own turn wait is added before every reply.
@@ -139,7 +143,7 @@ Event mapping on the socket:
   half-open sockets.
 - Close codes `1008` (auth / limit / balance) and `4002` (bad parameters) fail fast; others
   reconnect.
-- Audio is always `linear16` mono; `encoding` / `num_channels` accept only `"linear16"` / `1`.
+- Audio is always sent as `linear16` mono, which is what LiveKit hands the stream.
 
 # Test
 

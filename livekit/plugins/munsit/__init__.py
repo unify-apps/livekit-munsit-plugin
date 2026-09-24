@@ -1,5 +1,5 @@
 from . import models
-from .stt import STT, SpeechStream
+from .stt import STT, ListenOptions, SpeechStream, TranscribeOptions
 from .tts import TTS, ChunkedStream, SynthesizeStream
 from .version import __version__
 
@@ -8,6 +8,8 @@ __all__ = [
     "ChunkedStream",
     "SynthesizeStream",
     "STT",
+    "ListenOptions",
+    "TranscribeOptions",
     "SpeechStream",
     "models",
     "__version__",
@@ -21,7 +23,7 @@ from .log import logger
 
 class MunsitPlugin(Plugin):
     def __init__(self):
-        super().__init__(__name__, __version__, __package__, logger)
+        super().__init__(__name__, __version__, __package__ or __name__, logger)
 
 
 Plugin.register_plugin(MunsitPlugin())
