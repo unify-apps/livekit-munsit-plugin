@@ -195,52 +195,51 @@ async def speak(http, url: str, **stream_kwargs) -> tuple[np.ndarray, Exception 
 
 
 async def test_tts_streaming(http):
-    sentences = SENTENCES
     spans: dict[int, list[float]] = {}
     bodies: list[dict] = []
 
     async def handler(req):
         body = await req.json()
         bodies.append(body)
-        i = next(i for i, s in enumerate(sentences) if s in body["text"])
+        i = sentence_index(body["text"])
         spans[i] = [time.monotonic()]
         res = web.StreamResponse()
         await res.prepare(req)
-        pcm = np.full(2400, (i + 1) * 1000, dtype=np.int16).tobytes()  # 0.1s per sentence
+        pcm = tone(i)  # 0.1 s per sentence
         await res.write(pcm[:2400])
         await asyncio.sleep(0.3 if i == 0 else 0.0)
         await res.write(pcm[2400:])
         spans[i].append(time.monotonic())
         return res
 
-    runner, url = await serve([web.post("/text-to-speech/faseeh-v1-preview", handler)])
+    runner, url = await serve([web.post(TTS_PATH, handler)])
     munsit_tts = munsit.TTS(api_key="x", voice_id="v", base_url=url, http_session=http)
-    assert munsit_tts.capabilities.streaming and munsit_tts.capabilities.aligned_transcript
+    assert munsit_tts.capabilities.streaming
+    assert munsit_tts.capabilities.aligned_transcript
     assert not munsit.TTS(api_key="x", voice_id="v", streaming=False).capabilities.streaming
 
     stream = munsit_tts.stream()
-    stream.push_text(" ".join(sentences))
+    stream.push_text(" ".join(SENTENCES))
     stream.end_input()
     frames = [ev.frame async for ev in stream]
     samples = np.concatenate([np.frombuffer(f.data, dtype=np.int16) for f in frames])
 
-    values = [int(v) for v in samples if v]
-    runs = [v for j, v in enumerate(values) if j == 0 or v != values[j - 1]]
-    assert runs == [1000, 2000, 3000], runs  # pushed strictly in sentence order
+    assert runs(samples) == [1000, 2000, 3000], runs(samples)  # strictly in sentence order
     # one request at a time: a stream holds at most one of the account's concurrent slots
-    assert spans[0][1] <= spans[1][0] and spans[1][1] <= spans[2][0], spans
-    assert all(b["streaming"] and b["text"] == b["text"].strip() for b in bodies), bodies
+    assert spans[0][1] <= spans[1][0] <= spans[1][1] <= spans[2][0], spans
+    assert all(b["streaming"] for b in bodies), bodies
+    assert all(b["text"] == b["text"].strip() for b in bodies), bodies
 
     # each sentence's text is stamped where its audio starts
     timed = [t for f in frames for t in f.userdata.get(USERDATA_TIMED_TRANSCRIPT, [])]
-    assert [str(t).strip() for t in timed] == sentences, timed
+    assert [str(t).strip() for t in timed] == SENTENCES, timed
     assert np.allclose([t.start_time for t in timed], [0.0, 0.1, 0.2], atol=1e-6), timed
     await runner.cleanup()
 
 
 async def test_tts_pcm_stays_aligned(http):
-    """A chunk ending mid-sample, then a stall long enough for the emitter's slow-audio
-    flush (livekit/agents#7391), then a stray trailing byte: no later sample may shift.
+    """A chunk ending mid-sample (each chunk is flushed as it arrives, livekit/agents#7391),
+    then a stray trailing byte: no later sample may shift.
     """
 
     async def handler(req):
@@ -250,7 +249,7 @@ async def test_tts_pcm_stays_aligned(http):
         if i == 0:
             pcm = tone(0, 0.7)
             await res.write(pcm[:24001])  # 0.5s + half a sample
-            await asyncio.sleep(0.8)  # longer than the audio already sent
+            await asyncio.sleep(0.05)  # keep the two writes as separate reads
             await res.write(pcm[24001:] + b"\x00")
         else:
             await res.write(tone(i))
@@ -301,13 +300,85 @@ async def test_tts_sentence_retry(http):
         await runner.cleanup()
 
 
+def dry_at(arrivals: list[tuple[float, float]]) -> list[float]:
+    """Seconds into playback at which real-time playback of these frames runs dry."""
+    start = played_until = arrivals[0][0]
+    gaps = []
+    for at, duration in arrivals:
+        if at > played_until + 0.005:
+            gaps.append(played_until - start)
+            played_until = at
+        played_until += duration
+    return gaps
+
+
+def paced(chunks: list[tuple[int, int]]):
+    """A TTS handler writing 24 kHz tone chunks at (arrival ms, audio ms)."""
+
+    async def handler(req):
+        res = web.StreamResponse()
+        await res.prepare(req)
+        start = time.monotonic()
+        for at_ms, audio_ms in chunks:
+            await asyncio.sleep(max(0.0, at_ms / 1000 - (time.monotonic() - start)))
+            await res.write(np.full(24 * audio_ms, 1000, dtype=np.int16).tobytes())
+        return res
+
+    return handler
+
+
+async def frame_arrivals(munsit_tts, mode: str) -> list[tuple[float, float]]:
+    """(arrival time, duration) of every frame for one sentence, via stream() or synthesize()."""
+    if mode == "stream":
+        stream = munsit_tts.stream()
+        stream.push_text(SENTENCES[0])
+        stream.end_input()
+    else:
+        stream = munsit_tts.synthesize(SENTENCES[0])
+    async with stream:
+        return [(time.monotonic(), ev.frame.duration) async for ev in stream]
+
+
+async def test_tts_releases_audio_as_it_arrives(http):
+    """Playback must not run dry while received audio is still held back.
+
+    Munsit's measured timing (223 ms in 20 ms, then nothing until 147 ms) used to run dry
+    ~130 ms in: the tick and mute heard near each reply start. With a 100 ms burst and then
+    nothing until 300 ms, playback may only run dry once all 100 ms has played.
+    """
+    cases = {
+        "measured": ([(0, 138), (20, 85), (147, 226), (264, 258)], float("inf")),
+        "slow": ([(0, 100), (300, 200), (420, 200)], 0.095),
+    }
+    for name, (chunks, dry_not_before) in cases.items():
+        runner, url = await serve([web.post(TTS_PATH, paced(chunks))])
+        munsit_tts = munsit.TTS(api_key="x", voice_id="v", base_url=url, http_session=http)
+        for mode in ("stream", "synthesize"):
+            gaps = dry_at(await frame_arrivals(munsit_tts, mode))
+            assert all(t >= dry_not_before for t in gaps), (name, mode, gaps)
+        await runner.cleanup()
+
+
 def test_constructor_validation():
-    munsit.STT(api_key="x", encoding="linear16", num_channels=1)  # configs spelling out defaults
+    # null config values mean the defaults
+    stt = munsit.STT(
+        api_key="x",
+        listen=munsit.ListenOptions(sample_rate=None, endpointing_ms=None, smart_turn=None),
+        transcribe=munsit.TranscribeOptions(return_timestamps=None),
+    )
+    assert (stt._opts.sample_rate, stt._opts.endpointing_ms, stt._opts.smart_turn) == (16000, 800, True)
+    assert stt._opts.return_timestamps is True
+    # a rejected update changes nothing
+    try:
+        stt.update_options(model="munsit-en-ar", endpointing_ms=6000)
+    except ValueError:
+        pass
+    assert stt._opts.model == "munsit"
+    assert munsit.TTS(api_key="x", voice_id="v", tokenizer=None)._sentence_tokenizer is not None
     for build in (
-        lambda: munsit.STT(api_key="x", endpointing_ms=50),
+        lambda: munsit.STT(api_key="x", listen=munsit.ListenOptions(endpointing_ms=50)),
+        lambda: munsit.STT(api_key="x", listen=munsit.ListenOptions(sample_rate=44100)),
         lambda: munsit.STT(api_key="x").update_options(endpointing_ms=6000),
-        lambda: munsit.STT(api_key="x", encoding="mulaw"),
-        lambda: munsit.STT(api_key="x", num_channels=2),
     ):
         try:
             build()
@@ -327,6 +398,7 @@ async def main():
             test_tts_streaming,
             test_tts_pcm_stays_aligned,
             test_tts_sentence_retry,
+            test_tts_releases_audio_as_it_arrives,
         ):
             await test(http)
             print("ok", test.__name__)

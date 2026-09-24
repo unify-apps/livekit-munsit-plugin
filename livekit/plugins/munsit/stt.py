@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
-import os
 import time
 import weakref
 from dataclasses import dataclass, replace
@@ -20,16 +19,17 @@ from livekit.agents import (
     APIError,
     APIStatusError,
     APITimeoutError,
+    LanguageCode,
     stt,
     utils,
 )
-from livekit.agents.types import NOT_GIVEN, NotGivenOr
+from livekit.agents.types import NOT_GIVEN, NotGiven, NotGivenOr
 from livekit.agents.utils import AudioBuffer, is_given
 from livekit.agents.voice.io import TimedString
 
 from .log import logger
-from .models import STTEncodings, STTModels
-from .tts import AUTH_HEADER, BASE_URL, _raise_for_status
+from .models import STTModels
+from .tts import AUTH_HEADER, _api_key, _base_url, _flag, _raise_for_status, _string
 
 DEFAULT_STT_MODEL = "munsit"
 DEFAULT_LANGUAGE = "ar"
@@ -43,11 +43,51 @@ ENDPOINTING_RANGE = (100, 5000)
 
 # the socket closes with 1011 after 12s without audio, so keep well inside it
 KEEPALIVE_INTERVAL = 5.0
-# notices a half-open socket, which would otherwise hang recv_task
+# notices a half-open socket, which would otherwise hang _recv_events
 WS_HEARTBEAT = 30.0
 
 # transcribe takes up to 60 minutes of audio, so allow a slow upload
 TRANSCRIBE_TOTAL_TIMEOUT = 300.0
+
+
+# message types that end a socket; unexpected unless we are closing it
+_SOCKET_ENDED = (
+    aiohttp.WSMsgType.CLOSED,
+    aiohttp.WSMsgType.CLOSE,
+    aiohttp.WSMsgType.CLOSING,
+    aiohttp.WSMsgType.ERROR,
+)
+
+
+def _language(value: Any, default: str) -> LanguageCode:
+    """The language to report: `value` when it is a non-empty string, else `default`."""
+    return LanguageCode(value if isinstance(value, str) and value else default)
+
+
+def _word_time(word: dict, key: str, offset: float) -> float:
+    # a null timing must not raise, or the transcript is lost
+    return (word.get(key) or 0.0) + offset
+
+
+def _integer(value: Optional[int], default: int) -> int:
+    """Resolve a config integer: `None` means the default."""
+    return default if value is None else int(value)
+
+
+def _socket_error(ws: aiohttp.ClientWebSocketResponse, msg: aiohttp.WSMessage) -> APIError:
+    """The error for a socket that ended while it should still be open."""
+    if msg.type == aiohttp.WSMsgType.ERROR:
+        error = APIConnectionError("munsit connection lost")
+        error.__cause__ = ws.exception()  # as `raise ... from ws.exception()`
+        return error
+
+    code = ws.close_code or -1
+    return APIStatusError(
+        message=f"munsit connection closed unexpectedly ({code})",
+        # 1008 auth / limit / balance, 4002 bad parameters: a retry can't fix them
+        status_code=400 if code in (1008, 4002) else 500,
+        body=f"{msg.data=} {msg.extra=}",
+    )
 
 
 def _check_endpointing(endpointing_ms: int) -> None:
@@ -56,6 +96,32 @@ def _check_endpointing(endpointing_ms: int) -> None:
             f"munsit: endpointing_ms must be between {ENDPOINTING_RANGE[0]} and "
             f"{ENDPOINTING_RANGE[1]}, got {endpointing_ms}"
         )
+
+
+@dataclass
+class ListenOptions:
+    """`/listen` websocket settings, used when `streaming=True`. `None` means the default."""
+
+    sample_rate: Optional[int] = DEFAULT_SAMPLE_RATE  # 8000 or 16000; audio is resampled to it
+    interim_results: Optional[bool] = True  # emit partial transcripts
+    endpointing_ms: Optional[int] = DEFAULT_ENDPOINTING_MS  # 100-5000 ms of silence ends a turn
+    smart_turn: Optional[bool] = True  # semantic end-of-turn model on top of the silence timer
+    correlation_id: Optional[str] = None  # your session id, echoed back in Metadata
+    metadata: Optional[dict[str, Any]] = None  # JSON (<= 2 KB), sent base64-encoded
+
+
+@dataclass
+class TranscribeOptions:
+    """Extra `/audio/transcribe` fields, used when `streaming=False`. `None` means the default.
+
+    Turns and analysis come back in `SpeechData.metadata`.
+    """
+
+    return_confidence: Optional[bool] = False  # per-word confidence
+    return_timestamps: Optional[bool] = True  # word timings
+    return_turns: Optional[bool] = False  # the turns array
+    return_gender: Optional[bool] = False  # gender analysis per turn
+    return_sentiment: Optional[bool] = False  # sentiment analysis per turn
 
 
 @dataclass
@@ -118,20 +184,9 @@ class STT(stt.STT):
         model: Optional[STTModels | str] = DEFAULT_STT_MODEL,
         language: Optional[str] = DEFAULT_LANGUAGE,
         streaming: Optional[bool] = True,
-        interim_results: Optional[bool] = True,
-        encoding: Optional[STTEncodings | str] = ENCODING,
-        sample_rate: Optional[int] = DEFAULT_SAMPLE_RATE,
-        num_channels: Optional[int] = 1,
-        endpointing_ms: Optional[int] = DEFAULT_ENDPOINTING_MS,
-        smart_turn: Optional[bool] = True,
         hotwords: Optional[str] = None,
-        correlation_id: Optional[str] = None,
-        metadata: Optional[dict[str, Any]] = None,
-        return_confidence: Optional[bool] = False,
-        return_timestamps: Optional[bool] = True,
-        return_turns: Optional[bool] = False,
-        return_gender: Optional[bool] = False,
-        return_sentiment: Optional[bool] = False,
+        listen: Optional[ListenOptions] = None,
+        transcribe: Optional[TranscribeOptions] = None,
         api_key: NotGivenOr[str] = NOT_GIVEN,
         base_url: NotGivenOr[str] = NOT_GIVEN,
         http_session: Optional[aiohttp.ClientSession] = None,
@@ -145,43 +200,28 @@ class STT(stt.STT):
             streaming: True uses the `/listen` websocket, so partial transcripts arrive
                 while the caller is still talking. False uses `/audio/transcribe`, which
                 takes a complete utterance and answers once.
-            interim_results: Emit partial transcripts. Streaming only.
-            encoding: Must be "linear16"; LiveKit sends PCM16.
-            sample_rate: 8000 or 16000 Hz. Streaming only; audio is resampled to it.
-            num_channels: Must be 1.
-            endpointing_ms: 100-5000 ms of silence that ends a turn. Streaming only.
-            smart_turn: Semantic turn-completion model on top of the silence timer.
             hotwords: Comma-separated custom vocabulary. Ignored by "munsit-en-ar".
-            correlation_id: Your own session id, echoed back in Metadata. Streaming only.
-            metadata: JSON-serializable dict (<=2 KB), sent base64-encoded. Streaming only.
-            return_confidence: Add per-word confidence. Transcribe only.
-            return_timestamps: Word timings; on by default for "munsit". Transcribe only.
-            return_turns: Add the turns array. Transcribe only.
-            return_gender: Add gender analysis per turn. Transcribe only.
-            return_sentiment: Add sentiment analysis per turn. Transcribe only.
+            listen: Websocket settings (sample rate, endpointing, smart turn, ...).
+            transcribe: Extra `/audio/transcribe` fields (confidence, turns, ...).
             api_key: Munsit API key, or `MUNSIT_API_KEY` in the environment.
             base_url: API root; defaults to `MUNSIT_BASE_URL` or the global endpoint.
                 The websocket url is derived from it.
             http_session: Session to reuse instead of the agent's shared one.
             ssl: Verify TLS certificates.
 
-        Every argument accepts `None`, meaning the default above.
+        Every argument accepts `None`, meaning the default. Audio always goes out as
+        mono linear16, which is what LiveKit hands the stream.
         """
-        streaming = True if streaming is None else bool(streaming)
-        interim_results = True if interim_results is None else bool(interim_results)
-        sample_rate = DEFAULT_SAMPLE_RATE if sample_rate is None else int(sample_rate)
-        endpointing_ms = (
-            DEFAULT_ENDPOINTING_MS if endpointing_ms is None else int(endpointing_ms)
-        )
+        streaming = _flag(streaming, True)
+        listen = listen or ListenOptions()
+        transcribe = transcribe or TranscribeOptions()
+        interim_results = _flag(listen.interim_results, True)
+        sample_rate = _integer(listen.sample_rate, DEFAULT_SAMPLE_RATE)
+        endpointing_ms = _integer(listen.endpointing_ms, DEFAULT_ENDPOINTING_MS)
 
         if sample_rate not in SAMPLE_RATES:
             raise ValueError(f"munsit: sample_rate must be one of {SAMPLE_RATES}, got {sample_rate}")
         _check_endpointing(endpointing_ms)
-        # accepted for configs that spell out the defaults; other values mislabel the audio
-        if (encoding or ENCODING) != ENCODING:
-            raise ValueError(f"munsit: encoding must be {ENCODING!r}, got {encoding!r}")
-        if (1 if num_channels is None else int(num_channels)) != 1:
-            raise ValueError(f"munsit: num_channels must be 1, got {num_channels!r}")
 
         super().__init__(
             capabilities=stt.STTCapabilities(
@@ -190,30 +230,24 @@ class STT(stt.STT):
             )
         )
 
-        munsit_api_key = (api_key if is_given(api_key) else None) or os.environ.get("MUNSIT_API_KEY")
-        if not munsit_api_key:
-            raise ValueError("munsit: API key required. Set MUNSIT_API_KEY or pass api_key.")
-
-        url = base_url if is_given(base_url) and base_url else os.environ.get("MUNSIT_BASE_URL")
-
         self._opts = _STTOptions(
-            model=model or DEFAULT_STT_MODEL,
-            language=language or DEFAULT_LANGUAGE,
-            api_key=munsit_api_key,
-            base_url=(url or BASE_URL).rstrip("/"),
+            model=_string(model, DEFAULT_STT_MODEL),
+            language=_string(language, DEFAULT_LANGUAGE),
+            api_key=_api_key(api_key),
+            base_url=_base_url(base_url),
             ssl=ssl,
             sample_rate=sample_rate,
             interim_results=interim_results,
             endpointing_ms=endpointing_ms,
-            smart_turn=True if smart_turn is None else bool(smart_turn),
-            correlation_id=correlation_id,
-            metadata=metadata,
+            smart_turn=_flag(listen.smart_turn, True),
+            correlation_id=listen.correlation_id,
+            metadata=listen.metadata,
             hotwords=hotwords,
-            return_confidence=bool(return_confidence),
-            return_timestamps=True if return_timestamps is None else bool(return_timestamps),
-            return_turns=bool(return_turns),
-            return_gender=bool(return_gender),
-            return_sentiment=bool(return_sentiment),
+            return_confidence=bool(transcribe.return_confidence),
+            return_timestamps=_flag(transcribe.return_timestamps, True),
+            return_turns=bool(transcribe.return_turns),
+            return_gender=bool(transcribe.return_gender),
+            return_sentiment=bool(transcribe.return_sentiment),
         )
         self._session = http_session
         self._streams = weakref.WeakSet[SpeechStream]()
@@ -240,14 +274,16 @@ class STT(stt.STT):
         endpointing_ms: NotGivenOr[int] = NOT_GIVEN,
     ) -> None:
         """Update the options. Live streams re-apply them by reconnecting."""
-        if is_given(model):
+        if not isinstance(endpointing_ms, NotGiven):
+            _check_endpointing(endpointing_ms)  # first, so a bad value changes nothing
+        # isinstance, not is_given: PyCharm doesn't narrow is_given() on Literal unions
+        if not isinstance(model, NotGiven):
             self._opts.model = model
-        if is_given(language):
+        if not isinstance(language, NotGiven):
             self._opts.language = language
-        if is_given(hotwords):
+        if not isinstance(hotwords, NotGiven):
             self._opts.hotwords = hotwords
-        if is_given(endpointing_ms):
-            _check_endpointing(endpointing_ms)
+        if not isinstance(endpointing_ms, NotGiven):
             self._opts.endpointing_ms = endpointing_ms
 
         for stream in self._streams:
@@ -324,7 +360,7 @@ class STT(stt.STT):
             request_id=data.get("transcriptionId", ""),
             alternatives=[
                 stt.SpeechData(
-                    language=language if is_given(language) else opts.language,
+                    language=_language(language, opts.language),
                     text=data.get("transcription", ""),
                     start_time=0.0,
                     end_time=data.get("duration", 0.0) or 0.0,
@@ -354,7 +390,7 @@ class STT(stt.STT):
         return stream
 
     async def aclose(self) -> None:
-        for stream in list(self._streams):
+        for stream in self._streams.copy():  # a snapshot: aclose() awaits
             await stream.aclose()
         self._streams.clear()
         await super().aclose()
@@ -370,6 +406,7 @@ class SpeechStream(stt.SpeechStream):
         self._stt: STT = stt
         self._session = stt._ensure_session()
         self._speaking = False
+        self._closing_ws = False
         self._reconnect_event = asyncio.Event()
 
     def update_options(
@@ -380,129 +417,123 @@ class SpeechStream(stt.SpeechStream):
         hotwords: NotGivenOr[str] = NOT_GIVEN,
         endpointing_ms: NotGivenOr[int] = NOT_GIVEN,
     ) -> None:
-        if is_given(model):
+        if not isinstance(endpointing_ms, NotGiven):
+            _check_endpointing(endpointing_ms)  # first, so a bad value changes nothing
+        if not isinstance(model, NotGiven):
             self._opts.model = model
-        if is_given(language):
+        if not isinstance(language, NotGiven):
             self._opts.language = language
-        if is_given(hotwords):
+        if not isinstance(hotwords, NotGiven):
             self._opts.hotwords = hotwords
-        if is_given(endpointing_ms):
-            _check_endpointing(endpointing_ms)
+        if not isinstance(endpointing_ms, NotGiven):
             self._opts.endpointing_ms = endpointing_ms
 
         self._reconnect_event.set()
 
     async def _run(self) -> None:
-        closing_ws = False
-
-        async def keepalive_task(ws: aiohttp.ClientWebSocketResponse) -> None:
-            # outside the task group, so its sleep never delays closing; recv_task and
-            # the heartbeat notice a dropped socket
-            try:
-                while True:
-                    await ws.send_str(SpeechStream._KEEPALIVE_MSG)
-                    await asyncio.sleep(KEEPALIVE_INTERVAL)
-            except (aiohttp.ClientError, ConnectionError):
-                return
-
-        @utils.log_exceptions(logger=logger)
-        async def send_task(ws: aiohttp.ClientWebSocketResponse) -> None:
-            nonlocal closing_ws
-
-            # 50ms per frame, inside the 20-200ms the docs recommend
-            audio_bstream = utils.audio.AudioByteStream(
-                sample_rate=self._opts.sample_rate,
-                num_channels=1,
-                samples_per_channel=self._opts.sample_rate // 20,
-            )
-            try:
-                async for data in self._input_ch:
-                    frames: list[rtc.AudioFrame] = []
-                    if isinstance(data, rtc.AudioFrame):
-                        frames.extend(audio_bstream.write(data.data.tobytes()))
-                    elif isinstance(data, self._FlushSentinel):
-                        frames.extend(audio_bstream.flush())
-
-                    for frame in frames:
-                        await ws.send_bytes(frame.data.tobytes())
-
-                closing_ws = True
-                await ws.send_str(SpeechStream._CLOSE_MSG)
-            except (aiohttp.ClientError, ConnectionError) as e:
-                if closing_ws or self._session.closed:
-                    return
-                raise APIConnectionError("munsit connection closed unexpectedly") from e
-
-        @utils.log_exceptions(logger=logger)
-        async def recv_task(ws: aiohttp.ClientWebSocketResponse) -> None:
-            while True:
-                msg = await ws.receive()
-                if msg.type in (
-                    aiohttp.WSMsgType.CLOSED,
-                    aiohttp.WSMsgType.CLOSE,
-                    aiohttp.WSMsgType.CLOSING,
-                ):
-                    if closing_ws or self._session.closed:
-                        return
-
-                    code = ws.close_code or -1
-                    raise APIStatusError(
-                        message=f"munsit connection closed unexpectedly ({code})",
-                        # 1008 auth / limit / balance, 4002 bad parameters: a retry can't fix them
-                        status_code=400 if code in (1008, 4002) else 500,
-                        body=f"{msg.data=} {msg.extra=}",
-                    )
-
-                if msg.type == aiohttp.WSMsgType.ERROR:
-                    if closing_ws or self._session.closed:
-                        return
-                    raise APIConnectionError("munsit connection lost") from ws.exception()
-
-                if msg.type != aiohttp.WSMsgType.TEXT:
-                    logger.warning("unexpected munsit message type %s", msg.type)
-                    continue
-
-                try:
-                    self._process_stream_event(json.loads(msg.data))
-                except APIError:
-                    # a non-recoverable Error event: _main_task decides on the retry
-                    raise
-                except Exception:
-                    logger.exception("failed to process munsit message")
-
+        self._closing_ws = False
         while True:
             ws: aiohttp.ClientWebSocketResponse | None = None
             try:
                 ws = await self._connect_ws()
                 # server timestamps restart with every socket, update_options reconnects included
                 self.start_time = time.time()
-                tasks = [
-                    asyncio.create_task(send_task(ws)),
-                    asyncio.create_task(recv_task(ws)),
-                ]
-                tasks_group = asyncio.gather(*tasks)
-                keepalive = asyncio.create_task(keepalive_task(ws))
-                wait_reconnect_task = asyncio.create_task(self._reconnect_event.wait())
-                try:
-                    done, _ = await asyncio.wait(
-                        (tasks_group, wait_reconnect_task),
-                        return_when=asyncio.FIRST_COMPLETED,
-                    )
-                    for task in done:
-                        if task != wait_reconnect_task:
-                            task.result()
-
-                    if wait_reconnect_task not in done:
-                        break
-
-                    self._reconnect_event.clear()
-                finally:
-                    await utils.aio.gracefully_cancel(*tasks, keepalive, wait_reconnect_task)
-                    tasks_group.cancel()
-                    tasks_group.exception()  # retrieve the exception
+                if not await self._run_connection(ws):
+                    return
             finally:
                 if ws is not None:
                     await ws.close()
+
+    async def _run_connection(self, ws: aiohttp.ClientWebSocketResponse) -> bool:
+        """Serve one socket; True when update_options asked for a reconnect."""
+        tasks = [
+            asyncio.create_task(self._send_audio(ws)),
+            asyncio.create_task(self._recv_events(ws)),
+        ]
+        tasks_group = asyncio.gather(*tasks)
+        # outside the task group, so its sleep never delays closing; _recv_events and
+        # the heartbeat notice a dropped socket
+        keepalive = asyncio.create_task(self._keepalive(ws))
+        wait_reconnect = asyncio.create_task(self._reconnect_event.wait())
+        try:
+            done, _ = await asyncio.wait(
+                (tasks_group, wait_reconnect), return_when=asyncio.FIRST_COMPLETED
+            )
+            for task in done:
+                if task != wait_reconnect:
+                    task.result()
+
+            if wait_reconnect not in done:
+                return False
+
+            self._reconnect_event.clear()
+            return True
+        finally:
+            await utils.aio.gracefully_cancel(*tasks, keepalive, wait_reconnect)
+            tasks_group.cancel()
+            tasks_group.exception()  # retrieve the exception
+
+    def _closing(self) -> bool:
+        """A socket error is expected once CloseStream went out or the session is gone."""
+        return self._closing_ws or self._session.closed
+
+    async def _keepalive(self, ws: aiohttp.ClientWebSocketResponse) -> None:
+        try:
+            while True:
+                await ws.send_str(SpeechStream._KEEPALIVE_MSG)
+                await asyncio.sleep(KEEPALIVE_INTERVAL)
+        except (aiohttp.ClientError, ConnectionError):
+            return
+
+    @utils.log_exceptions(logger=logger)
+    async def _send_audio(self, ws: aiohttp.ClientWebSocketResponse) -> None:
+        # 50ms per frame, inside the 20-200ms the docs recommend
+        audio_bstream = utils.audio.AudioByteStream(
+            sample_rate=self._opts.sample_rate,
+            num_channels=1,
+            samples_per_channel=self._opts.sample_rate // 20,
+        )
+        try:
+            async for data in self._input_ch:
+                frames: list[rtc.AudioFrame] = []
+                if isinstance(data, rtc.AudioFrame):
+                    frames.extend(audio_bstream.write(data.data.tobytes()))
+                elif isinstance(data, self._FlushSentinel):
+                    frames.extend(audio_bstream.flush())
+
+                for frame in frames:
+                    await ws.send_bytes(frame.data.tobytes())
+
+            self._closing_ws = True
+            await ws.send_str(SpeechStream._CLOSE_MSG)
+        except (aiohttp.ClientError, ConnectionError) as e:
+            if self._closing():
+                return
+            raise APIConnectionError("munsit connection closed unexpectedly") from e
+
+    @utils.log_exceptions(logger=logger)
+    async def _recv_events(self, ws: aiohttp.ClientWebSocketResponse) -> None:
+        while True:
+            msg = await ws.receive()
+            if msg.type in _SOCKET_ENDED:
+                if self._closing():
+                    return
+                raise _socket_error(ws, msg)
+
+            if msg.type != aiohttp.WSMsgType.TEXT:
+                logger.warning("unexpected munsit message type %s", msg.type)
+                continue
+
+            self._handle_text(msg.data)
+
+    def _handle_text(self, text: str) -> None:
+        try:
+            self._process_stream_event(json.loads(text))
+        except APIError:
+            # a non-recoverable Error event: _main_task decides on the retry
+            raise
+        except Exception:
+            logger.exception("failed to process munsit message")
 
     async def _connect_ws(self) -> aiohttp.ClientWebSocketResponse:
         try:
@@ -526,75 +557,78 @@ class SpeechStream(stt.SpeechStream):
 
     def _process_stream_event(self, data: dict) -> None:
         event_type = data.get("type")
-
         if event_type == "SpeechStarted":
             self._start_speaking(speech_start_time=data.get("ts"))
-
         elif event_type == "Results":
-            transcript = data.get("transcript") or ""
-            is_final = bool(data.get("is_final"))
-            # is_final alone is a forced split (~60s of speech), not the end of a turn
-            speech_final = is_final and bool(data.get("speech_final"))
-            if not transcript:
-                if speech_final:
-                    self._end_speaking()
-                return
-
-            # smart_turn can suppress SpeechStarted, so Results may come first
-            self._start_speaking()
-            # socket-relative timings, offset to stay linear across retries; a null
-            # timing must not raise, or the transcript is lost
-            offset = self.start_time_offset
-            raw_words = data.get("words") or []
-            words = [
-                TimedString(
-                    text=w.get("word", ""),
-                    start_time=(w.get("start") or 0.0) + offset,
-                    end_time=(w.get("end") or 0.0) + offset,
-                    confidence=w.get("confidence", NOT_GIVEN),
-                )
-                for w in raw_words
-            ]
-            self._event_ch.send_nowait(
-                stt.SpeechEvent(
-                    type=stt.SpeechEventType.FINAL_TRANSCRIPT
-                    if is_final
-                    else stt.SpeechEventType.INTERIM_TRANSCRIPT,
-                    alternatives=[
-                        stt.SpeechData(
-                            language=data.get("language") or self._opts.language,
-                            text=transcript,
-                            start_time=words[0].start_time if words else 0.0,
-                            end_time=words[-1].end_time if words else 0.0,
-                            confidence=data.get("confidence", 0.0) or 0.0,
-                            words=words or None,
-                        )
-                    ],
-                )
-            )
-            if speech_final:
-                # the UtteranceEnd that follows is a no-op, so take the end time here
-                self._end_speaking(speech_end_time=raw_words[-1].get("end") if raw_words else None)
-
+            self._on_results(data)
         elif event_type == "UtteranceEnd":
             self._end_speaking(speech_end_time=data.get("last_word_end"))
-
         elif event_type == "Error":
-            message = data.get("message", "unknown munsit error")
-            if data.get("recoverable"):
-                logger.warning("munsit error: %s", message, extra={"code": data.get("code")})
-            else:
-                # auth / limit / balance failures close with 1008, so a bare Error is
-                # worth a reconnect, except 4002 (bad parameters would be resent)
-                code = data.get("code")
-                raise APIError(f"munsit error {code}: {message}", body=data, retryable=code != 4002)
-
+            self._on_error(data)
         elif event_type in ("Metadata", "Gender", "Sentiment"):
             # Gender / Sentiment arrive after the final transcript: nothing to attach them to
             logger.debug("munsit %s: %s", event_type, data)
-
         else:
             logger.warning("unexpected munsit event %s", event_type)
+
+    def _on_results(self, data: dict) -> None:
+        transcript = data.get("transcript") or ""
+        is_final = bool(data.get("is_final"))
+        # is_final alone is a forced split (~60s of speech), not the end of a turn
+        speech_final = is_final and bool(data.get("speech_final"))
+        raw_words = data.get("words") or []
+        if not transcript:
+            if speech_final:
+                self._end_speaking()
+            return
+
+        # smart_turn can suppress SpeechStarted, so Results may come first
+        self._start_speaking()
+        self._event_ch.send_nowait(self._transcript_event(data, transcript, is_final, raw_words))
+        if speech_final:
+            # the UtteranceEnd that follows is a no-op, so take the end time here
+            self._end_speaking(speech_end_time=raw_words[-1].get("end") if raw_words else None)
+
+    def _transcript_event(
+        self, data: dict, transcript: str, is_final: bool, raw_words: list[dict]
+    ) -> stt.SpeechEvent:
+        # socket-relative timings, offset to stay linear across retries
+        offset = self.start_time_offset
+        words = [
+            TimedString(
+                text=w.get("word", ""),
+                start_time=_word_time(w, "start", offset),
+                end_time=_word_time(w, "end", offset),
+                confidence=w.get("confidence", NOT_GIVEN),
+            )
+            for w in raw_words
+        ]
+        return stt.SpeechEvent(
+            type=stt.SpeechEventType.FINAL_TRANSCRIPT
+            if is_final
+            else stt.SpeechEventType.INTERIM_TRANSCRIPT,
+            alternatives=[
+                stt.SpeechData(
+                    language=_language(data.get("language"), self._opts.language),
+                    text=transcript,
+                    start_time=_word_time(raw_words[0], "start", offset) if raw_words else 0.0,
+                    end_time=_word_time(raw_words[-1], "end", offset) if raw_words else 0.0,
+                    confidence=data.get("confidence", 0.0) or 0.0,
+                    words=words or None,
+                )
+            ],
+        )
+
+    def _on_error(self, data: dict) -> None:
+        message = data.get("message", "unknown munsit error")
+        if data.get("recoverable"):
+            logger.warning("munsit error: %s", message, extra={"code": data.get("code")})
+            return
+
+        # auth / limit / balance failures close with 1008, so a bare Error is
+        # worth a reconnect, except 4002 (bad parameters would be resent)
+        code = data.get("code")
+        raise APIError(f"munsit error {code}: {message}", body=data, retryable=code != 4002)
 
     def _start_speaking(self, *, speech_start_time: float | None = None) -> None:
         if self._speaking:
