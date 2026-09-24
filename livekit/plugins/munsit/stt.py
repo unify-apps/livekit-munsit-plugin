@@ -436,7 +436,8 @@ class SpeechStream(stt.SpeechStream):
             ws: aiohttp.ClientWebSocketResponse | None = None
             try:
                 ws = await self._connect_ws()
-                # server timestamps restart with every socket, update_options reconnects included
+                # Munsit's clock restarts with every socket; this is an upper bound that
+                # _send_audio pulls back to when the socket's first audio was captured
                 self.start_time = time.time()
                 if not await self._run_connection(ws):
                     return
@@ -493,6 +494,7 @@ class SpeechStream(stt.SpeechStream):
             num_channels=1,
             samples_per_channel=self._opts.sample_rate // 20,
         )
+        sent = 0.0  # seconds of audio on this socket: Munsit's clock
         try:
             async for data in self._input_ch:
                 frames: list[rtc.AudioFrame] = []
@@ -503,6 +505,11 @@ class SpeechStream(stt.SpeechStream):
 
                 for frame in frames:
                     await ws.send_bytes(frame.data.tobytes())
+                    sent += frame.duration
+                    # audio buffered during the handshake goes out first, so anchoring at
+                    # connect put every timestamp late; the frame just sent was captured
+                    # no later than now, and the smallest (now - sent) is the true start
+                    self.start_time = min(self.start_time, time.time() - sent)
 
             self._closing_ws = True
             await ws.send_str(SpeechStream._CLOSE_MSG)

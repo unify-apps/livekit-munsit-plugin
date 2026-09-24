@@ -11,6 +11,7 @@ import aiohttp
 import numpy as np
 from aiohttp import web
 
+from livekit import rtc
 from livekit.agents import APIConnectOptions
 from livekit.agents import stt as lkstt
 from livekit.agents.types import USERDATA_TIMED_TRANSCRIPT
@@ -102,6 +103,49 @@ async def test_stt_turn(http):
     await runner.cleanup()
 
 
+async def test_stt_speech_end_time(http):
+    """speech_end_time must be the wall time the speech ended, even when the handshake
+    is slow: LiveKit measures min_endpointing_delay from it, and a late value waits in full."""
+    speech_end = 1.0  # seconds into the audio
+
+    async def handler(req):
+        await asyncio.sleep(0.3)  # slow handshake: audio buffers meanwhile
+        ws = web.WebSocketResponse()
+        await ws.prepare(req)
+        heard = 0.0
+        async for msg in ws:
+            heard += len(msg.data) / 2 / 16000 if msg.type == aiohttp.WSMsgType.BINARY else 0
+            if heard >= speech_end + 0.3:
+                await ws.send_str(json.dumps({
+                    "type": "Results", "transcript": "نعم", "is_final": True, "speech_final": True,
+                    "words": [{"word": "نعم", "start": 0.5, "end": speech_end}],
+                }))
+                break
+        await ws.close()
+        return ws
+
+    runner, url = await serve([web.get("/listen", handler)])
+    stream = munsit.STT(api_key="x", base_url=url, http_session=http).stream()
+    first_frame = time.time()
+
+    async def feed() -> None:  # 20 ms frames in real time, like the room input
+        while True:
+            stream.push_frame(rtc.AudioFrame(b"\0\0" * 320, 16000, 1, 320))
+            await asyncio.sleep(0.02)
+
+    feeder = asyncio.create_task(feed())
+    end_event = None
+    async for ev in stream:
+        if ev.type == T.END_OF_SPEECH:
+            end_event = ev
+            break
+    feeder.cancel()
+    await stream.aclose()
+    error = end_event.speech_end_time - (first_frame + speech_end)
+    assert abs(error) < 0.08, f"speech_end_time off by {error:+.3f}s"
+    await runner.cleanup()
+
+
 async def test_stt_error_retry(http):
     for code, max_retry, want_connections in ((1, 1, 2), (4002, 3, 1)):
         connections: list[int] = []
@@ -148,8 +192,6 @@ async def test_stt_transcribe_confidence(http):
 
     runner, url = await serve([web.post("/audio/transcribe", handler)])
     stt = munsit.STT(api_key="x", base_url=url, http_session=http, streaming=False)
-    from livekit import rtc
-
     ev = await stt.recognize(rtc.AudioFrame.create(16000, 1, 1600))
     alt = ev.alternatives[0]
     assert alt.text == "مرحبا بك" and abs(alt.confidence - 0.7) < 1e-9, alt
@@ -392,6 +434,7 @@ async def main():
     async with aiohttp.ClientSession() as http:
         for test in (
             test_stt_turn,
+            test_stt_speech_end_time,
             test_stt_error_retry,
             test_stt_connect_refused_is_retryable,
             test_stt_transcribe_confidence,
