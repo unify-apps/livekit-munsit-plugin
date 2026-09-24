@@ -59,19 +59,32 @@ async def test_stt_turn(http):
         {"type": "SpeechStarted", "ts": 1.5},
         {"type": "Results", "transcript": "", "is_final": True, "speech_final": True},
         {"type": "Error", "code": 1, "message": "hiccup", "recoverable": True},
+        # a null word timing must not drop the transcript
+        {"type": "SpeechStarted", "ts": 2.5},
+        {"type": "Results", "transcript": "نعم", "is_final": True, "speech_final": True,
+         "words": [{"word": "نعم", "start": None, "end": None}]},
     ]
     runner, url = await serve([listen_route(script, [])])
     stream = munsit.STT(api_key="x", base_url=url, http_session=http).stream()
 
     events = []
-    async for ev in stream:
-        events.append(ev)
-        if len(events) == 6:
-            break
+
+    async def collect() -> None:
+        async for ev in stream:
+            events.append(ev)
+            if len(events) == 9:
+                return
+
+    try:
+        await asyncio.wait_for(collect(), 5)
+    except asyncio.TimeoutError:
+        raise AssertionError(f"stream stalled after {[e.type for e in events]}") from None
     assert [e.type for e in events] == [
         T.START_OF_SPEECH, T.INTERIM_TRANSCRIPT, T.FINAL_TRANSCRIPT, T.END_OF_SPEECH,
         T.START_OF_SPEECH, T.END_OF_SPEECH,
+        T.START_OF_SPEECH, T.FINAL_TRANSCRIPT, T.END_OF_SPEECH,
     ], [e.type for e in events]
+    assert events[7].alternatives[0].text == "نعم"
 
     final = events[2].alternatives[0]
     assert final.text == "مرحبا بك"
@@ -129,7 +142,8 @@ async def test_stt_transcribe_confidence(http):
         return web.json_response({"data": {
             "transcriptionId": "t1", "transcription": "مرحبا بك", "duration": 1.0,
             "timestamps": [{"word": "مرحبا", "start": 0.1, "end": 0.5, "confidence": 0.8},
-                           {"word": "بك", "start": 0.6, "end": 0.9, "confidence": 0.6}],
+                           {"word": "بك", "start": 0.6, "end": 0.9, "confidence": 0.6},
+                           {"word": "و", "start": 0.9, "end": 1.0, "confidence": None}],
         }}, status=201)
 
     runner, url = await serve([web.post("/audio/transcribe", handler)])
@@ -142,12 +156,46 @@ async def test_stt_transcribe_confidence(http):
     await runner.cleanup()
 
 
+TTS_PATH = "/text-to-speech/faseeh-v1-preview"
+SENTENCES = [
+    "The first sentence is the slow one here.",
+    "The second sentence comes after it.",
+    "The third sentence closes the reply now.",
+]
+
+
+def sentence_index(text: str) -> int:
+    return next(i for i, s in enumerate(SENTENCES) if s in text)
+
+
+def tone(i: int, seconds: float = 0.1) -> bytes:
+    """A steady 24 kHz PCM16 tone whose value names the sentence: 1000, 2000, ..."""
+    return np.full(int(24000 * seconds), (i + 1) * 1000, dtype=np.int16).tobytes()
+
+
+def runs(samples: np.ndarray) -> list[int]:
+    values = [int(v) for v in samples if v]
+    return [v for j, v in enumerate(values) if j == 0 or v != values[j - 1]]
+
+
+async def speak(http, url: str, **stream_kwargs) -> tuple[np.ndarray, Exception | None]:
+    stream = munsit.TTS(api_key="x", voice_id="v", base_url=url, http_session=http).stream(
+        **stream_kwargs
+    )
+    stream.push_text(" ".join(SENTENCES))
+    stream.end_input()
+    frames, error = [], None
+    try:
+        async for ev in stream:
+            frames.append(np.frombuffer(ev.frame.data, dtype=np.int16))
+    except Exception as e:
+        error = e
+    await stream.aclose()
+    return (np.concatenate(frames) if frames else np.zeros(0, np.int16)), error
+
+
 async def test_tts_streaming(http):
-    sentences = [
-        "The first sentence is the slow one here.",
-        "The second sentence comes after it.",
-        "The third sentence closes the reply now.",
-    ]
+    sentences = SENTENCES
     spans: dict[int, list[float]] = {}
     bodies: list[dict] = []
 
@@ -190,6 +238,69 @@ async def test_tts_streaming(http):
     await runner.cleanup()
 
 
+async def test_tts_pcm_stays_aligned(http):
+    """A chunk ending mid-sample, then a stall long enough for the emitter's slow-audio
+    flush (livekit/agents#7391), then a stray trailing byte: no later sample may shift.
+    """
+
+    async def handler(req):
+        i = sentence_index((await req.json())["text"])
+        res = web.StreamResponse()
+        await res.prepare(req)
+        if i == 0:
+            pcm = tone(0, 0.7)
+            await res.write(pcm[:24001])  # 0.5s + half a sample
+            await asyncio.sleep(0.8)  # longer than the audio already sent
+            await res.write(pcm[24001:] + b"\x00")
+        else:
+            await res.write(tone(i))
+        return res
+
+    runner, url = await serve([web.post(TTS_PATH, handler)])
+    samples, error = await speak(http, url)
+    assert error is None, error
+    assert runs(samples) == [1000, 2000, 3000], runs(samples)[:6]
+
+    # synthesize() reads a PCM body the same way
+    munsit_tts = munsit.TTS(api_key="x", voice_id="v", base_url=url, http_session=http)
+    async with munsit_tts.synthesize(SENTENCES[0]) as chunked:
+        frames = [np.frombuffer(ev.frame.data, dtype=np.int16) async for ev in chunked]
+    assert runs(np.concatenate(frames)) == [1000], runs(np.concatenate(frames))[:4]
+    await runner.cleanup()
+
+
+async def test_tts_sentence_retry(http):
+    cases = [
+        # failing sentence, status, failures, audio heard, requests for that sentence
+        (1, 500, 1, [1000, 2000, 3000], 2),  # audio already played: retried in place
+        (1, 400, 1, [1000], 1),  # not retryable: the reply ends there
+        (0, 500, 99, [], 3),  # nothing played yet: only the framework retries
+    ]
+    for failing, status, failures, want_runs, want_calls in cases:
+        calls: list[int] = []
+
+        async def handler(req, failing=failing, status=status, failures=failures, calls=calls):
+            i = sentence_index((await req.json())["text"])
+            if i == failing:
+                calls.append(1)
+                if len(calls) <= failures:
+                    return web.json_response({"errorMessage": "boom"}, status=status)
+            res = web.StreamResponse()
+            await res.prepare(req)
+            await res.write(tone(i))
+            return res
+
+        runner, url = await serve([web.post(TTS_PATH, handler)])
+        samples, error = await speak(
+            http, url, conn_options=APIConnectOptions(max_retry=2, retry_interval=0.05)
+        )
+        case = (failing, status)
+        assert runs(samples) == want_runs, (case, runs(samples))
+        assert len(calls) == want_calls, (case, len(calls))
+        assert (error is None) == (want_runs == [1000, 2000, 3000]), (case, error)
+        await runner.cleanup()
+
+
 def test_constructor_validation():
     munsit.STT(api_key="x", encoding="linear16", num_channels=1)  # configs spelling out defaults
     for build in (
@@ -214,6 +325,8 @@ async def main():
             test_stt_connect_refused_is_retryable,
             test_stt_transcribe_confidence,
             test_tts_streaming,
+            test_tts_pcm_stays_aligned,
+            test_tts_sentence_retry,
         ):
             await test(http)
             print("ok", test.__name__)

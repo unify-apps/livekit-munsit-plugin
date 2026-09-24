@@ -58,6 +58,13 @@ by default), sends one chunked request per sentence, in order, and stamps each s
 with the time its audio starts. Audio arrives faster than it plays, so the next request usually
 starts while the previous sentence is still playing and its time-to-first-byte is not heard.
 
+Once part of a reply has played, the framework no longer retries the stream, so a sentence that
+fails before producing any audio is retried on its own (up to `max_retry`, like the Soniox
+plugin); before that, the framework's own retry replays the stream. PCM is handed to LiveKit in
+whole 16-bit samples: network chunks can end mid-sample, and before livekit-agents 1.8.3 a
+mid-stream flush dropped that half sample and turned the rest of the reply into static
+([livekit/agents#7391](https://github.com/livekit/agents/pull/7391)).
+
 Lower `min_sentence_len` on the tokenizer to cut first-audio latency; blingfire's default of 20
 **characters** groups short Arabic sentences into one request.
 

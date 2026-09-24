@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import weakref
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, replace
 from typing import Any, Optional
 
@@ -11,6 +12,7 @@ import aiohttp
 from livekit.agents import (
     APIConnectionError,
     APIConnectOptions,
+    APIError,
     APIStatusError,
     APITimeoutError,
     tokenize,
@@ -29,6 +31,7 @@ BASE_URL = "https://api.munsit.com/api/v1"
 AUTH_HEADER = "x-api-key"
 
 NUM_CHANNELS = 1
+BYTES_PER_SAMPLE = 2 * NUM_CHANNELS  # PCM16
 
 DEFAULT_MODEL = "faseeh-v1-preview"
 DEFAULT_SAMPLE_RATE = 24000
@@ -99,6 +102,28 @@ class _TTSOptions:
             "dialect": self.dialect,
             "streaming": self.streaming if streaming is None else streaming,
         }
+
+
+async def _pcm_samples(res: aiohttp.ClientResponse) -> AsyncIterator[bytes]:
+    """The body of a PCM16 response, in whole samples.
+
+    Network chunks can end mid-sample. Before livekit-agents 1.8.3 a mid-stream
+    emitter flush (which fires whenever audio arrives slower than real time) dropped
+    that half sample, and every sample after it played as loud static
+    (livekit/agents#7391). Responses are also joined sentence after sentence, so a
+    stray byte at the end of one must not shift the next.
+    """
+    carry = b""
+    async for data in res.content.iter_any():
+        if carry:
+            data = carry + data
+        whole = len(data) - len(data) % BYTES_PER_SAMPLE
+        data, carry = data[:whole], data[whole:]
+        if data:
+            yield data
+
+    if carry:
+        logger.warning("munsit tts response ended mid-sample, dropped %d byte(s)", len(carry))
 
 
 async def _raise_for_status(res: aiohttp.ClientResponse, request_id: str) -> None:
@@ -321,7 +346,8 @@ class ChunkedStream(tts.ChunkedStream):
                     mime_type="audio/pcm" if self._opts.streaming else "audio/wav",
                 )
 
-                async for data, _ in res.content.iter_chunks():
+                body = _pcm_samples(res) if self._opts.streaming else res.content.iter_any()
+                async for data in body:
                     output_emitter.push(data)
 
                 output_emitter.flush()
@@ -384,7 +410,12 @@ class SynthesizeStream(tts.SynthesizeStream):
                     continue
                 self._mark_started()
                 output_emitter.push_timed_transcript(TimedString(text=ev.token, start_time=duration))
-                duration += await self._synthesize_sentence(text, request_id, output_emitter)
+                duration += await self._synthesize_sentence(
+                    text, request_id, output_emitter, retry=duration > 0
+                )
+                # play the sentence's tail now rather than when the next one starts,
+                # as Speechify's stream and the framework's StreamAdapter do
+                output_emitter.flush()
 
         tasks = [
             asyncio.create_task(_tokenize_input()),
@@ -392,7 +423,7 @@ class SynthesizeStream(tts.SynthesizeStream):
         ]
         try:
             await asyncio.gather(*tasks)
-        except (APIStatusError, APIConnectionError, APITimeoutError):
+        except APIError:
             raise
         except asyncio.TimeoutError:
             raise APITimeoutError() from None
@@ -403,22 +434,51 @@ class SynthesizeStream(tts.SynthesizeStream):
             await sent_stream.aclose()
 
     async def _synthesize_sentence(
-        self, text: str, request_id: str, output_emitter: tts.AudioEmitter
+        self, text: str, request_id: str, output_emitter: tts.AudioEmitter, *, retry: bool
     ) -> float:
-        """Stream one sentence's audio into the emitter; returns its duration in seconds."""
+        """Stream one sentence's audio into the emitter; returns its duration in seconds.
+
+        The framework only retries a stream that has played nothing, so once earlier
+        sentences reached the user a transient failure here would silence the rest of
+        the reply. With `retry` the sentence is requested again while it has pushed no
+        audio of its own, the rule the Soniox plugin uses. Before anything has played,
+        the framework's own retry replays the whole stream instead.
+        """
         pushed = 0
-        async with self._tts._ensure_session().post(
-            self._opts.synthesize_url,
-            headers=self._opts.headers,
-            json=self._opts.payload(text, streaming=True),
-            timeout=_timeout(self._conn_options),
-            ssl=self._opts.ssl,
-        ) as res:
-            await _raise_for_status(res, request_id)
+        attempt = 0
+        while True:
+            try:
+                async with self._tts._ensure_session().post(
+                    self._opts.synthesize_url,
+                    headers=self._opts.headers,
+                    json=self._opts.payload(text, streaming=True),
+                    timeout=_timeout(self._conn_options),
+                    ssl=self._opts.ssl,
+                ) as res:
+                    await _raise_for_status(res, request_id)
 
-            logger.debug("munsit tts sentence started", extra={"request_id": request_id})
-            async for data, _ in res.content.iter_chunks():
-                output_emitter.push(data)
-                pushed += len(data)
+                    logger.debug("munsit tts sentence started", extra={"request_id": request_id})
+                    async for data in _pcm_samples(res):
+                        output_emitter.push(data)
+                        pushed += len(data)
 
-        return pushed / (self._opts.sample_rate * NUM_CHANNELS * 2)  # PCM16
+                return pushed / (self._opts.sample_rate * BYTES_PER_SAMPLE)
+            except (APIError, asyncio.TimeoutError, aiohttp.ClientError) as e:
+                retryable = e.retryable if isinstance(e, APIError) else True
+                if not (
+                    retry
+                    and retryable
+                    and pushed == 0
+                    and attempt < self._conn_options.max_retry
+                ):
+                    raise  # _run maps it to an APIError
+
+                interval = self._conn_options._interval_for_retry(attempt)
+                logger.warning(
+                    "munsit tts sentence failed: %s, retrying in %ss",
+                    e,
+                    interval,
+                    extra={"request_id": request_id, "attempt": attempt + 1},
+                )
+                await asyncio.sleep(interval)
+                attempt += 1

@@ -321,7 +321,7 @@ class STT(stt.STT):
         ]
 
         # per-word only, and only with return_confidence
-        confidences = [w.confidence for w in words if is_given(w.confidence)]
+        confidences = [w.confidence for w in words if isinstance(w.confidence, (int, float))]
 
         return stt.SpeechEvent(
             type=stt.SpeechEventType.FINAL_TRANSCRIPT,
@@ -552,14 +552,15 @@ class SpeechStream(stt.SpeechStream):
             # Munsit only sends Results once speech is under way, but an interim can
             # be the first thing we see when smart_turn suppresses SpeechStarted
             self._start_speaking()
-            # word timings are socket-relative; the offset keeps them linear across retries
+            # word timings are socket-relative; the offset keeps them linear across
+            # retries. A null timing must not raise: that would drop the transcript
             offset = self.start_time_offset
             raw_words = data.get("words") or []
             words = [
                 TimedString(
                     text=w.get("word", ""),
-                    start_time=w.get("start", 0.0) + offset,
-                    end_time=w.get("end", 0.0) + offset,
+                    start_time=(w.get("start") or 0.0) + offset,
+                    end_time=(w.get("end") or 0.0) + offset,
                     confidence=w.get("confidence", NOT_GIVEN),
                 )
                 for w in raw_words
