@@ -103,7 +103,7 @@ class ListenOptions:
     """`/listen` websocket settings, used when `streaming=True`. `None` means the default."""
 
     sample_rate: Optional[int] = DEFAULT_SAMPLE_RATE  # 8000 or 16000; audio is resampled to it
-    interim_results: Optional[bool] = True
+    interim_results: Optional[bool] = True  # emit partial transcripts
     endpointing_ms: Optional[int] = DEFAULT_ENDPOINTING_MS  # 100-5000 ms of silence ends a turn
     smart_turn: Optional[bool] = True  # semantic end-of-turn model on top of the silence timer
     correlation_id: Optional[str] = None  # your session id, echoed back in Metadata
@@ -112,13 +112,16 @@ class ListenOptions:
 
 @dataclass
 class TranscribeOptions:
-    """Extra `/audio/transcribe` fields, used when `streaming=False`. `None` means the default."""
+    """Extra `/audio/transcribe` fields, used when `streaming=False`. `None` means the default.
 
-    return_confidence: Optional[bool] = False
+    Turns and analysis come back in `SpeechData.metadata`.
+    """
+
+    return_confidence: Optional[bool] = False  # per-word confidence
     return_timestamps: Optional[bool] = True  # word timings
-    return_turns: Optional[bool] = False
-    return_gender: Optional[bool] = False
-    return_sentiment: Optional[bool] = False
+    return_turns: Optional[bool] = False  # the turns array
+    return_gender: Optional[bool] = False  # gender analysis per turn
+    return_sentiment: Optional[bool] = False  # sentiment analysis per turn
 
 
 @dataclass
@@ -271,6 +274,8 @@ class STT(stt.STT):
         endpointing_ms: NotGivenOr[int] = NOT_GIVEN,
     ) -> None:
         """Update the options. Live streams re-apply them by reconnecting."""
+        if not isinstance(endpointing_ms, NotGiven):
+            _check_endpointing(endpointing_ms)  # first, so a bad value changes nothing
         # isinstance, not is_given: PyCharm doesn't narrow is_given() on Literal unions
         if not isinstance(model, NotGiven):
             self._opts.model = model
@@ -279,7 +284,6 @@ class STT(stt.STT):
         if not isinstance(hotwords, NotGiven):
             self._opts.hotwords = hotwords
         if not isinstance(endpointing_ms, NotGiven):
-            _check_endpointing(endpointing_ms)
             self._opts.endpointing_ms = endpointing_ms
 
         for stream in self._streams:
@@ -413,6 +417,8 @@ class SpeechStream(stt.SpeechStream):
         hotwords: NotGivenOr[str] = NOT_GIVEN,
         endpointing_ms: NotGivenOr[int] = NOT_GIVEN,
     ) -> None:
+        if not isinstance(endpointing_ms, NotGiven):
+            _check_endpointing(endpointing_ms)  # first, so a bad value changes nothing
         if not isinstance(model, NotGiven):
             self._opts.model = model
         if not isinstance(language, NotGiven):
@@ -420,7 +426,6 @@ class SpeechStream(stt.SpeechStream):
         if not isinstance(hotwords, NotGiven):
             self._opts.hotwords = hotwords
         if not isinstance(endpointing_ms, NotGiven):
-            _check_endpointing(endpointing_ms)
             self._opts.endpointing_ms = endpointing_ms
 
         self._reconnect_event.set()

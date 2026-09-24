@@ -242,7 +242,7 @@ class TTS(tts.TTS):
         )
         self._sentence_tokenizer = (
             tokenizer
-            if is_given(tokenizer)
+            if is_given(tokenizer) and tokenizer is not None
             else tokenize.blingfire.SentenceTokenizer(retain_format=True)
         )
         self._session = http_session

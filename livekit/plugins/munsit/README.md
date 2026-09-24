@@ -110,8 +110,8 @@ Through the agent config (`get_stt`):
 ```
 
 `endpointing` and `enable_interim_results` reuse the config keys the other STT providers use.
-Transcribe-only extras (`return_confidence`, `return_timestamps`, `return_turns`,
-`return_gender`, `return_sentiment`) go into `TranscribeOptions`.
+Transcribe-only extras stay top-level config keys (`return_confidence`, `return_timestamps`,
+`return_turns`, `return_gender`, `return_sentiment`); `get_stt` passes them to `TranscribeOptions`.
 
 When LiveKit's VAD decides the turn (`turn_detection="vad"`), set `smart_turn` off and
 `endpointing` low (~300): otherwise Munsit's own turn wait is added before every reply.
