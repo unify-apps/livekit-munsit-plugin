@@ -44,7 +44,7 @@ STABILITY_RANGE = (0.0, 1.0)
 SPEED_RANGE = (0.7, 1.2)
 SAMPLE_RATE_RANGE = (8000, 48000)
 
-# generation is slower than the wire, so the budget covers the whole body, not a read
+# covers the whole streamed body, like the upstream HTTP TTS plugins
 REQUEST_TOTAL_TIMEOUT = 30.0
 
 
@@ -55,12 +55,7 @@ def _timeout(conn_options: APIConnectOptions) -> aiohttp.ClientTimeout:
 
 
 def _number(name: str, value: Any, default: float, bounds: tuple[float, float]) -> float:
-    """Resolve a config number: `None` means the default, and it must be in range.
-
-    Values arrive from JSON config where an untouched field is as likely to be `null`
-    or a string as it is to be absent, so the defaults are resolved here rather than
-    at every call site.
-    """
+    """Resolve a config number (JSON may send `null` or a string); out of range raises."""
     if value is None:
         return default
 
@@ -105,13 +100,11 @@ class _TTSOptions:
 
 
 async def _pcm_samples(res: aiohttp.ClientResponse) -> AsyncIterator[bytes]:
-    """The body of a PCM16 response, in whole samples.
+    """Yield a PCM16 body in whole samples.
 
-    Network chunks can end mid-sample. Before livekit-agents 1.8.3 a mid-stream
-    emitter flush (which fires whenever audio arrives slower than real time) dropped
-    that half sample, and every sample after it played as loud static
-    (livekit/agents#7391). Responses are also joined sentence after sentence, so a
-    stray byte at the end of one must not shift the next.
+    A chunk can end mid-sample; livekit-agents < 1.8.3 drops that half sample on a
+    mid-stream flush and the rest of the reply plays as static (livekit/agents#7391).
+    A stray byte at the end of a response is dropped, not carried into the next one.
     """
     carry = b""
     async for data in res.content.iter_any():
@@ -140,7 +133,7 @@ async def _raise_for_status(res: aiohttp.ClientResponse, request_id: str) -> Non
 
     message = res.reason or "munsit tts request failed"
     if isinstance(body, dict):
-        # the API answers with errorCode/errorMessage; the docs table calls them code/message
+        # the API sends errorCode/errorMessage; the docs say code/message
         message = body.get("errorMessage") or body.get("message") or message
 
     raise APIStatusError(message, status_code=res.status, request_id=request_id, body=body)
@@ -172,17 +165,13 @@ class TTS(tts.TTS):
             speed: 0.7-1.2 playback rate.
             sample_rate: 8000-48000 Hz. 48000 is the engine-native rate.
             dialect: "auto", "emirati" or "fusha".
-            streaming: True advertises the streaming capability, so the agent feeds
-                text in through `stream()` and audio comes back as PCM16 chunks while
-                it is still being generated. False makes `synthesize()` the only path:
-                one request per (adapter-tokenized) sentence, answered with a complete
-                WAV. `stream()` always asks Munsit for chunks — concatenated WAV
-                headers mid-segment would not decode.
+            streaming: True streams text in through `stream()` and plays PCM16 chunks
+                as they are generated. False makes the session call `synthesize()` per
+                sentence, each answered with a complete WAV.
             api_key: Munsit API key, or `MUNSIT_API_KEY` in the environment.
             base_url: API root; defaults to `MUNSIT_BASE_URL` or the global endpoint.
                 Use `https://ae.api.faseeh.ai/api/v1` for UAE data residency.
-            tokenizer: Splits streamed text into sentences, one request each. Defaults
-                to the one the framework's `StreamAdapter` uses.
+            tokenizer: Splits streamed text into sentences, one request each.
             http_session: Session to reuse instead of the agent's shared one.
             ssl: Verify TLS certificates.
 
@@ -196,7 +185,7 @@ class TTS(tts.TTS):
         )
 
         super().__init__(
-            # aligned: each sentence's text is stamped with where its audio starts
+            # sentence-level timed transcripts
             capabilities=tts.TTSCapabilities(streaming=streaming, aligned_transcript=streaming),
             sample_rate=sample_rate,
             num_channels=NUM_CHANNELS,
@@ -253,11 +242,7 @@ class TTS(tts.TTS):
         speed: NotGivenOr[float] = NOT_GIVEN,
         dialect: NotGivenOr[TTSDialects | str] = NOT_GIVEN,
     ) -> None:
-        """Update the options used by streams created from here on.
-
-        `sample_rate` and `streaming` are fixed at construction: they are baked into
-        the capabilities the agent session already negotiated.
-        """
+        """Apply to requests made from here on; `sample_rate` and `streaming` are fixed."""
         if is_given(voice_id):
             self._opts.voice_id = voice_id
         if is_given(model):
@@ -314,12 +299,7 @@ class TTS(tts.TTS):
 
 
 class ChunkedStream(tts.ChunkedStream):
-    """One request for the whole text.
-
-    With `streaming=True` the body is read as it arrives (raw PCM16), so the first
-    frame is emitted long before generation finishes; with `streaming=False` Munsit
-    answers with a complete WAV instead.
-    """
+    """One request for the whole text: PCM16 read as it arrives, or a WAV if not streaming."""
 
     def __init__(self, *, tts: TTS, input_text: str, conn_options: APIConnectOptions) -> None:
         super().__init__(tts=tts, input_text=input_text, conn_options=conn_options)
@@ -364,15 +344,10 @@ class ChunkedStream(tts.ChunkedStream):
 
 
 class SynthesizeStream(tts.SynthesizeStream):
-    """Incremental text in, audio out.
+    """One request per sentence, in order, like the framework's `StreamAdapter`.
 
-    Munsit's streaming endpoint is plain chunked HTTP with no incremental input, so
-    this works like the framework's `StreamAdapter`: text is tokenized into
-    sentences, each one is its own request read as raw PCM16, and its text is
-    pushed as a timed transcript where its audio starts. Requests go one at a
-    time, in order: the emitter concatenates bytes, so overlapping them would
-    interleave the audio, and a stream never holds more than one of the account's
-    concurrent request slots.
+    Munsit takes no incremental text, so each sentence is its own chunked PCM16
+    request, and its text is pushed as a timed transcript where its audio starts.
     """
 
     def __init__(self, *, tts: TTS, conn_options: APIConnectOptions) -> None:
@@ -405,16 +380,16 @@ class SynthesizeStream(tts.SynthesizeStream):
         async def _synthesize() -> None:
             duration = 0.0
             async for ev in sent_stream:
-                # retain_format keeps whitespace for the transcript, not for Munsit
+                # the transcript keeps the whitespace; Munsit gets it stripped
                 if not (text := ev.token.strip()):
                     continue
                 self._mark_started()
-                output_emitter.push_timed_transcript(TimedString(text=ev.token, start_time=duration))
+                timed = TimedString(text=ev.token, start_time=duration)
+                output_emitter.push_timed_transcript(timed)
                 duration += await self._synthesize_sentence(
                     text, request_id, output_emitter, retry=duration > 0
                 )
-                # play the sentence's tail now rather than when the next one starts,
-                # as Speechify's stream and the framework's StreamAdapter do
+                # play this sentence's tail now, as Speechify and StreamAdapter do
                 output_emitter.flush()
 
         tasks = [
@@ -436,13 +411,10 @@ class SynthesizeStream(tts.SynthesizeStream):
     async def _synthesize_sentence(
         self, text: str, request_id: str, output_emitter: tts.AudioEmitter, *, retry: bool
     ) -> float:
-        """Stream one sentence's audio into the emitter; returns its duration in seconds.
+        """Stream one sentence into the emitter and return its duration in seconds.
 
-        The framework only retries a stream that has played nothing, so once earlier
-        sentences reached the user a transient failure here would silence the rest of
-        the reply. With `retry` the sentence is requested again while it has pushed no
-        audio of its own, the rule the Soniox plugin uses. Before anything has played,
-        the framework's own retry replays the whole stream instead.
+        Once audio has played the framework no longer retries, so with `retry` a failed
+        sentence is re-requested while it has pushed nothing (the Soniox plugin's rule).
         """
         pushed = 0
         attempt = 0

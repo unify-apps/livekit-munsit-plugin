@@ -2,9 +2,7 @@
 
 Arabic [TTS](https://docs.munsit.com/text-to-speech/get-started) and
 [STT](https://docs.munsit.com/speech-to-text/transcribe) over the Munsit / Faseeh API, in the same
-shape as the other LiveKit plugins. Lives in this folder for now; it will move to its own GitHub
-repo + `requirements.txt` entry later, so it depends on nothing outside `livekit-agents` and
-`aiohttp`.
+shape as the other LiveKit plugins. Depends only on `livekit-agents`.
 
 # TTS
 
@@ -52,21 +50,15 @@ Munsit has one endpoint — `POST /text-to-speech/{model_id}` — and a `streami
 | `streaming=True` (default) | streaming + aligned transcript: the session drives `stream()` | one request per sentence | chunked raw PCM16 mono |
 | `streaming=False` | the session wraps `synthesize()` in `tts.StreamAdapter` | one request per sentence | complete `audio/wav` |
 
-The endpoint takes no incremental text input, so `SynthesizeStream` works like the framework's
-`StreamAdapter`: it tokenizes the LLM output into sentences (the `tokenizer` argument, blingfire
-by default), sends one chunked request per sentence, in order, and stamps each sentence's text
-with the time its audio starts. Audio arrives faster than it plays, so the next request usually
-starts while the previous sentence is still playing and its time-to-first-byte is not heard.
+Munsit takes no incremental text, so `SynthesizeStream` works like the framework's `StreamAdapter`:
+it splits the LLM output into sentences (the `tokenizer` argument) and sends one chunked request
+per sentence, in order.
 
-Once part of a reply has played, the framework no longer retries the stream, so a sentence that
-fails before producing any audio is retried on its own (up to `max_retry`, like the Soniox
-plugin); before that, the framework's own retry replays the stream. PCM is handed to LiveKit in
-whole 16-bit samples: network chunks can end mid-sample, and before livekit-agents 1.8.3 a
-mid-stream flush dropped that half sample and turned the rest of the reply into static
-([livekit/agents#7391](https://github.com/livekit/agents/pull/7391)).
-
-Lower `min_sentence_len` on the tokenizer to cut first-audio latency; blingfire's default of 20
-**characters** groups short Arabic sentences into one request.
+- A sentence that fails after earlier ones have played is retried on its own (up to `max_retry`).
+- PCM goes to LiveKit in whole samples; before livekit-agents 1.8.3 a half sample could turn the
+  rest of a reply into static ([livekit/agents#7391](https://github.com/livekit/agents/pull/7391)).
+- Lower `min_sentence_len` to cut first-audio latency; blingfire's default of 20 **characters**
+  groups short Arabic sentences into one request.
 
 ## Other bits
 
@@ -113,9 +105,12 @@ Through the agent config (`get_stt`):
 }
 ```
 
-`endpointing` and `enable_interim_results` reuse the config keys the other STT providers already
-use. Transcribe-only extras: `return_confidence`, `return_timestamps`, `return_turns`,
+`endpointing` and `enable_interim_results` reuse the config keys the other STT providers use.
+Transcribe-only extras: `return_confidence`, `return_timestamps`, `return_turns`,
 `return_gender`, `return_sentiment`.
+
+When LiveKit's VAD decides the turn (`turn_detection="vad"`), set `smart_turn` off and
+`endpointing` low (~300): otherwise Munsit's own turn wait is added before every reply.
 
 ## The two modes
 
@@ -124,10 +119,8 @@ use. Transcribe-only extras: `return_confidence`, `return_timestamps`, `return_t
 | `streaming=True` | `wss://…/api/v1/listen` | `stream()` → `SpeechStream` |
 | `streaming=False` | `POST /api/v1/audio/transcribe` (multipart wav) | `recognize()` |
 
-`streaming` sets `STTCapabilities.streaming`, which is what decides whether the agent session opens
-a socket or buffers an utterance and posts it. The key goes in the `x-api-key` header on both,
-including the websocket handshake — the `?api_key=` form the docs offer for browsers would put it
-in every access log.
+The key goes in the `x-api-key` header on both, including the websocket handshake (the `?api_key=`
+form would put it in access logs).
 
 Event mapping on the socket:
 
@@ -141,22 +134,16 @@ Event mapping on the socket:
 | `Error` `recoverable:true` | warning log |
 | `Metadata` / `Gender` / `Sentiment` | debug log only |
 
-`is_final: true` with `speech_final: false` is a forced split during long speech (~60s), not a turn
-end, so it does not close the turn. `Gender` and `Sentiment` arrive *after* the turn's final
-transcript, so there is no event left to attach them to — they are logged at debug.
-
-A `KeepAlive` goes out every 5s (the socket closes with `1011` after 12s without audio) and the
-connection carries a 30s heartbeat so a half-open socket triggers a reconnect instead of hanging.
-Close codes `1008` (auth / session limit / no balance) and `4002` (invalid connection parameters)
-map to a non-retryable error; the rest reconnect.
-
-Audio always goes out as `linear16` mono, which is what LiveKit hands the stream. `encoding` and
-`num_channels` are accepted for configs that spell them out, but only as `"linear16"` and `1` —
-Munsit's `mulaw` / `alaw` would mislabel PCM16 bytes, so any other value raises.
+- `is_final` without `speech_final` is a forced split in long speech (~60s), not a turn end.
+- A `KeepAlive` goes out every 5s (Munsit closes after 12s without audio); a 30s heartbeat catches
+  half-open sockets.
+- Close codes `1008` (auth / limit / balance) and `4002` (bad parameters) fail fast; others
+  reconnect.
+- Audio is always `linear16` mono; `encoding` / `num_channels` accept only `"linear16"` / `1`.
 
 # Test
 
-Drives the real plugin against a local stand-in for the API — no key and no network needed:
+Runs the plugin against a local fake of the API; no key or network needed:
 
 ```bash
 pip install -e . && python tests/test_munsit.py

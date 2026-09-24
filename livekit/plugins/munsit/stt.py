@@ -43,9 +43,11 @@ ENDPOINTING_RANGE = (100, 5000)
 
 # the socket closes with 1011 after 12s without audio, so keep well inside it
 KEEPALIVE_INTERVAL = 5.0
-# without a heartbeat a half-open socket parks recv_task forever and the
-# exception-driven reconnect below never runs
+# notices a half-open socket, which would otherwise hang recv_task
 WS_HEARTBEAT = 30.0
+
+# transcribe takes up to 60 minutes of audio, so allow a slow upload
+TRANSCRIBE_TOTAL_TIMEOUT = 300.0
 
 
 def _check_endpointing(endpointing_ms: int) -> None:
@@ -54,10 +56,6 @@ def _check_endpointing(endpointing_ms: int) -> None:
             f"munsit: endpointing_ms must be between {ENDPOINTING_RANGE[0]} and "
             f"{ENDPOINTING_RANGE[1]}, got {endpointing_ms}"
         )
-
-
-# transcribe accepts up to 60 minutes of audio; a slow upload should not look like a hang
-TRANSCRIBE_TOTAL_TIMEOUT = 300.0
 
 
 @dataclass
@@ -148,10 +146,9 @@ class STT(stt.STT):
                 while the caller is still talking. False uses `/audio/transcribe`, which
                 takes a complete utterance and answers once.
             interim_results: Emit partial transcripts. Streaming only.
-            encoding: Must be "linear16". LiveKit hands the stream PCM16, so Munsit's
-                mulaw / alaw would mislabel the audio; anything else raises.
+            encoding: Must be "linear16"; LiveKit sends PCM16.
             sample_rate: 8000 or 16000 Hz. Streaming only; audio is resampled to it.
-            num_channels: Must be 1; the stream is mono.
+            num_channels: Must be 1.
             endpointing_ms: 100-5000 ms of silence that ends a turn. Streaming only.
             smart_turn: Semantic turn-completion model on top of the silence timer.
             hotwords: Comma-separated custom vocabulary. Ignored by "munsit-en-ar".
@@ -180,8 +177,7 @@ class STT(stt.STT):
         if sample_rate not in SAMPLE_RATES:
             raise ValueError(f"munsit: sample_rate must be one of {SAMPLE_RATES}, got {sample_rate}")
         _check_endpointing(endpointing_ms)
-        # kept as arguments so configs that spell out the defaults still load; any
-        # other value would make Munsit misread the audio, so fail loudly instead
+        # accepted for configs that spell out the defaults; other values mislabel the audio
         if (encoding or ENCODING) != ENCODING:
             raise ValueError(f"munsit: encoding must be {ENCODING!r}, got {encoding!r}")
         if (1 if num_channels is None else int(num_channels)) != 1:
@@ -400,10 +396,8 @@ class SpeechStream(stt.SpeechStream):
         closing_ws = False
 
         async def keepalive_task(ws: aiohttp.ClientWebSocketResponse) -> None:
-            # the socket closes with 1011 after 12s of silence. Kept out of the task
-            # group: its sleep would hold the stream open for up to 5s after
-            # CloseStream, and a dropped socket already surfaces in recv_task
-            # (heartbeat covers the half-open case)
+            # outside the task group, so its sleep never delays closing; recv_task and
+            # the heartbeat notice a dropped socket
             try:
                 while True:
                     await ws.send_str(SpeechStream._KEEPALIVE_MSG)
@@ -454,8 +448,7 @@ class SpeechStream(stt.SpeechStream):
                     code = ws.close_code or -1
                     raise APIStatusError(
                         message=f"munsit connection closed unexpectedly ({code})",
-                        # 1008 is auth / session limit / no balance, 4002 invalid
-                        # connection parameters — retrying cannot fix either
+                        # 1008 auth / limit / balance, 4002 bad parameters: a retry can't fix them
                         status_code=400 if code in (1008, 4002) else 500,
                         body=f"{msg.data=} {msg.extra=}",
                     )
@@ -472,7 +465,7 @@ class SpeechStream(stt.SpeechStream):
                 try:
                     self._process_stream_event(json.loads(msg.data))
                 except APIError:
-                    # a non-recoverable Error event; let _main_task decide on the retry
+                    # a non-recoverable Error event: _main_task decides on the retry
                     raise
                 except Exception:
                     logger.exception("failed to process munsit message")
@@ -481,8 +474,7 @@ class SpeechStream(stt.SpeechStream):
             ws: aiohttp.ClientWebSocketResponse | None = None
             try:
                 ws = await self._connect_ws()
-                # server timestamps restart with every socket, including the
-                # update_options reconnect that the base retry loop never sees
+                # server timestamps restart with every socket, update_options reconnects included
                 self.start_time = time.time()
                 tasks = [
                     asyncio.create_task(send_task(ws)),
@@ -541,19 +533,17 @@ class SpeechStream(stt.SpeechStream):
         elif event_type == "Results":
             transcript = data.get("transcript") or ""
             is_final = bool(data.get("is_final"))
-            # is_final without speech_final is a forced split mid-speech (~60s), not
-            # the end of a turn — UtteranceEnd is the real signal
+            # is_final alone is a forced split (~60s of speech), not the end of a turn
             speech_final = is_final and bool(data.get("speech_final"))
             if not transcript:
                 if speech_final:
                     self._end_speaking()
                 return
 
-            # Munsit only sends Results once speech is under way, but an interim can
-            # be the first thing we see when smart_turn suppresses SpeechStarted
+            # smart_turn can suppress SpeechStarted, so Results may come first
             self._start_speaking()
-            # word timings are socket-relative; the offset keeps them linear across
-            # retries. A null timing must not raise: that would drop the transcript
+            # socket-relative timings, offset to stay linear across retries; a null
+            # timing must not raise, or the transcript is lost
             offset = self.start_time_offset
             raw_words = data.get("words") or []
             words = [
@@ -583,7 +573,7 @@ class SpeechStream(stt.SpeechStream):
                 )
             )
             if speech_final:
-                # UtteranceEnd is a no-op once this ends the turn, so carry its end time
+                # the UtteranceEnd that follows is a no-op, so take the end time here
                 self._end_speaking(speech_end_time=raw_words[-1].get("end") if raw_words else None)
 
         elif event_type == "UtteranceEnd":
@@ -594,17 +584,13 @@ class SpeechStream(stt.SpeechStream):
             if data.get("recoverable"):
                 logger.warning("munsit error: %s", message, extra={"code": data.get("code")})
             else:
-                # auth / balance / session limit arrive as close code 1008 (non-retryable
-                # in recv_task), so a bare Error is worth a reconnect — except 4002,
-                # invalid connection parameters, which a reconnect would resend;
-                # max_retry bounds one that keeps coming back
+                # auth / limit / balance failures close with 1008, so a bare Error is
+                # worth a reconnect, except 4002 (bad parameters would be resent)
                 code = data.get("code")
                 raise APIError(f"munsit error {code}: {message}", body=data, retryable=code != 4002)
 
         elif event_type in ("Metadata", "Gender", "Sentiment"):
-            # Metadata carries session ids and closing billing; Gender/Sentiment arrive
-            # after the turn's final transcript, so there is no event left to attach
-            # them to — surfaced in the log for anyone who wants them
+            # Gender / Sentiment arrive after the final transcript: nothing to attach them to
             logger.debug("munsit %s: %s", event_type, data)
 
         else:
