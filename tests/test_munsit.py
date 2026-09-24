@@ -146,6 +146,39 @@ async def test_stt_speech_end_time(http):
     await runner.cleanup()
 
 
+async def test_stt_usage(http):
+    """LiveKit's session report counts streamed STT only from RECOGNITION_USAGE events;
+    they must add up to the audio Munsit received, the tail included when the session
+    closes the stream (aclose, not end_input)."""
+    heard = [0.0]
+
+    async def handler(req):
+        ws = web.WebSocketResponse()
+        await ws.prepare(req)
+        async for msg in ws:
+            if msg.type == aiohttp.WSMsgType.BINARY:
+                heard[0] += len(msg.data) / 2 / 16000
+        return ws
+
+    runner, url = await serve([web.get("/listen", handler)])
+    engine = munsit.STT(api_key="x", base_url=url, http_session=http)
+    usage: list[float] = []
+    engine.on("metrics_collected", lambda m: usage.append(m.audio_duration))
+    stream = engine.stream()
+    for _ in range(350):  # 7s of 20 ms frames
+        stream.push_frame(rtc.AudioFrame(b"\0\0" * 320, 16000, 1, 320))
+
+    async def all_heard() -> None:
+        while heard[0] < 7.0 - 1e-6:
+            await asyncio.sleep(0.01)
+
+    await asyncio.wait_for(all_heard(), 5)
+    await stream.aclose()
+    assert len(usage) == 2 and usage[0] >= 5.0, usage  # one mid-stream report, then the tail
+    assert abs(sum(usage) - heard[0]) < 1e-6, (usage, heard[0])
+    await runner.cleanup()
+
+
 async def test_stt_error_retry(http):
     for code, max_retry, want_connections in ((1, 1, 2), (4002, 3, 1)):
         connections: list[int] = []
@@ -435,6 +468,7 @@ async def main():
         for test in (
             test_stt_turn,
             test_stt_speech_end_time,
+            test_stt_usage,
             test_stt_error_retry,
             test_stt_connect_refused_is_retryable,
             test_stt_transcribe_confidence,

@@ -45,6 +45,8 @@ ENDPOINTING_RANGE = (100, 5000)
 KEEPALIVE_INTERVAL = 5.0
 # notices a half-open socket, which would otherwise hang _recv_events
 WS_HEARTBEAT = 30.0
+# seconds of streamed audio per usage report, the cadence LiveKit's own plugins use
+USAGE_REPORT_INTERVAL = 5.0
 
 # transcribe takes up to 60 minutes of audio, so allow a slow upload
 TRANSCRIBE_TOTAL_TIMEOUT = 300.0
@@ -495,6 +497,7 @@ class SpeechStream(stt.SpeechStream):
             samples_per_channel=self._opts.sample_rate // 20,
         )
         sent = 0.0  # seconds of audio on this socket: Munsit's clock
+        unreported = 0.0  # of it, not yet reported as usage
         try:
             async for data in self._input_ch:
                 frames: list[rtc.AudioFrame] = []
@@ -506,10 +509,14 @@ class SpeechStream(stt.SpeechStream):
                 for frame in frames:
                     await ws.send_bytes(frame.data.tobytes())
                     sent += frame.duration
+                    unreported += frame.duration
                     # audio buffered during the handshake goes out first, so anchoring at
                     # connect put every timestamp late; the frame just sent was captured
                     # no later than now, and the smallest (now - sent) is the true start
                     self.start_time = min(self.start_time, time.time() - sent)
+                    if unreported >= USAGE_REPORT_INTERVAL:
+                        self._report_usage(unreported)
+                        unreported = 0.0
 
             self._closing_ws = True
             await ws.send_str(SpeechStream._CLOSE_MSG)
@@ -517,6 +524,19 @@ class SpeechStream(stt.SpeechStream):
             if self._closing():
                 return
             raise APIConnectionError("munsit connection closed unexpectedly") from e
+        finally:
+            # Munsit bills the audio it received: the tail too, on close, reconnect or drop
+            self._report_usage(unreported)
+
+    def _report_usage(self, audio_duration: float) -> None:
+        """LiveKit counts streamed STT usage only from these events."""
+        if audio_duration > 0:
+            self._event_ch.send_nowait(
+                stt.SpeechEvent(
+                    type=stt.SpeechEventType.RECOGNITION_USAGE,
+                    recognition_usage=stt.RecognitionUsage(audio_duration=audio_duration),
+                )
+            )
 
     @utils.log_exceptions(logger=logger)
     async def _recv_events(self, ws: aiohttp.ClientWebSocketResponse) -> None:
