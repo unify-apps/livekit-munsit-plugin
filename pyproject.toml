@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "livekit-plugins-munsit"
-version = "1.0.0"
+dynamic = ["version"]
 description = "LiveKit Agents plugin for Munsit (Faseeh) Arabic TTS and STT"
 readme = "README.md"
 license = "Apache-2.0"
@@ -40,7 +40,10 @@ dependencies = [
 ]
 
 [project.urls]
-Repository = "https://github.com/Swayam-Hingu-PE/livekit-munsit-plugin"
+Repository = "https://github.com/unify-apps/livekit-munsit-plugin"
+
+[tool.hatch.version]
+path = "livekit/plugins/munsit/version.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["livekit"]

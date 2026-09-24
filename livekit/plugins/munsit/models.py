@@ -9,5 +9,5 @@ TTSDialects = Literal["auto", "emirati", "fusha"]
 # https://docs.munsit.com/speech-to-text/transcribe — `munsit-en-ar` code-switches.
 STTModels = Literal["munsit", "munsit-en-ar"]
 
-# https://docs.munsit.com/speech-to-text/streaming — `encoding` query parameter.
-STTEncodings = Literal["linear16", "mulaw", "alaw"]
+# Munsit also takes mulaw / alaw, but LiveKit sends PCM16 (like Cartesia's pcm_s16le).
+STTEncodings = Literal["linear16"]

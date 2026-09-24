@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import weakref
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, replace
 from typing import Any, Optional
 
@@ -11,6 +12,7 @@ import aiohttp
 from livekit.agents import (
     APIConnectionError,
     APIConnectOptions,
+    APIError,
     APIStatusError,
     APITimeoutError,
     tokenize,
@@ -19,6 +21,7 @@ from livekit.agents import (
 )
 from livekit.agents.types import DEFAULT_API_CONNECT_OPTIONS, NOT_GIVEN, NotGivenOr
 from livekit.agents.utils import is_given
+from livekit.agents.voice.io import TimedString
 
 from .log import logger
 from .models import TTSDialects, TTSModels
@@ -28,6 +31,7 @@ BASE_URL = "https://api.munsit.com/api/v1"
 AUTH_HEADER = "x-api-key"
 
 NUM_CHANNELS = 1
+BYTES_PER_SAMPLE = 2 * NUM_CHANNELS  # PCM16
 
 DEFAULT_MODEL = "faseeh-v1-preview"
 DEFAULT_SAMPLE_RATE = 24000
@@ -40,7 +44,7 @@ STABILITY_RANGE = (0.0, 1.0)
 SPEED_RANGE = (0.7, 1.2)
 SAMPLE_RATE_RANGE = (8000, 48000)
 
-# generation is slower than the wire, so the budget covers the whole body, not a read
+# covers the whole streamed body, like the upstream HTTP TTS plugins
 REQUEST_TOTAL_TIMEOUT = 30.0
 
 
@@ -51,12 +55,7 @@ def _timeout(conn_options: APIConnectOptions) -> aiohttp.ClientTimeout:
 
 
 def _number(name: str, value: Any, default: float, bounds: tuple[float, float]) -> float:
-    """Resolve a config number: `None` means the default, and it must be in range.
-
-    Values arrive from JSON config where an untouched field is as likely to be `null`
-    or a string as it is to be absent, so the defaults are resolved here rather than
-    at every call site.
-    """
+    """Resolve a config number (JSON may send `null` or a string); out of range raises."""
     if value is None:
         return default
 
@@ -100,8 +99,28 @@ class _TTSOptions:
         }
 
 
+async def _pcm_samples(res: aiohttp.ClientResponse) -> AsyncIterator[bytes]:
+    """Yield a PCM16 body in whole samples.
+
+    A chunk can end mid-sample; livekit-agents < 1.8.3 drops that half sample on a
+    mid-stream flush and the rest of the reply plays as static (livekit/agents#7391).
+    A stray byte at the end of a response is dropped, not carried into the next one.
+    """
+    carry = b""
+    async for data in res.content.iter_any():
+        if carry:
+            data = carry + data
+        whole = len(data) - len(data) % BYTES_PER_SAMPLE
+        data, carry = data[:whole], data[whole:]
+        if data:
+            yield data
+
+    if carry:
+        logger.warning("munsit tts response ended mid-sample, dropped %d byte(s)", len(carry))
+
+
 async def _raise_for_status(res: aiohttp.ClientResponse, request_id: str) -> None:
-    if res.status == 200:
+    if 200 <= res.status < 300:
         return
 
     try:
@@ -114,7 +133,7 @@ async def _raise_for_status(res: aiohttp.ClientResponse, request_id: str) -> Non
 
     message = res.reason or "munsit tts request failed"
     if isinstance(body, dict):
-        # the API answers with errorCode/errorMessage; the docs table calls them code/message
+        # the API sends errorCode/errorMessage; the docs say code/message
         message = body.get("errorMessage") or body.get("message") or message
 
     raise APIStatusError(message, status_code=res.status, request_id=request_id, body=body)
@@ -146,12 +165,9 @@ class TTS(tts.TTS):
             speed: 0.7-1.2 playback rate.
             sample_rate: 8000-48000 Hz. 48000 is the engine-native rate.
             dialect: "auto", "emirati" or "fusha".
-            streaming: True advertises the streaming capability, so the agent feeds
-                text in through `stream()` and audio comes back as PCM16 chunks while
-                it is still being generated. False makes `synthesize()` the only path:
-                one request per (adapter-tokenized) sentence, answered with a complete
-                WAV. `stream()` always asks Munsit for chunks — concatenated WAV
-                headers mid-segment would not decode.
+            streaming: True streams text in through `stream()` and plays PCM16 chunks
+                as they are generated. False makes the session call `synthesize()` per
+                sentence, each answered with a complete WAV.
             api_key: Munsit API key, or `MUNSIT_API_KEY` in the environment.
             base_url: API root; defaults to `MUNSIT_BASE_URL` or the global endpoint.
                 Use `https://ae.api.faseeh.ai/api/v1` for UAE data residency.
@@ -169,7 +185,8 @@ class TTS(tts.TTS):
         )
 
         super().__init__(
-            capabilities=tts.TTSCapabilities(streaming=streaming),
+            # sentence-level timed transcripts
+            capabilities=tts.TTSCapabilities(streaming=streaming, aligned_transcript=streaming),
             sample_rate=sample_rate,
             num_channels=NUM_CHANNELS,
         )
@@ -196,7 +213,9 @@ class TTS(tts.TTS):
             ssl=ssl,
         )
         self._sentence_tokenizer = (
-            tokenizer if is_given(tokenizer) else tokenize.blingfire.SentenceTokenizer()
+            tokenizer
+            if is_given(tokenizer)
+            else tokenize.blingfire.SentenceTokenizer(retain_format=True)
         )
         self._session = http_session
         self._streams = weakref.WeakSet[SynthesizeStream]()
@@ -223,11 +242,7 @@ class TTS(tts.TTS):
         speed: NotGivenOr[float] = NOT_GIVEN,
         dialect: NotGivenOr[TTSDialects | str] = NOT_GIVEN,
     ) -> None:
-        """Update the options used by streams created from here on.
-
-        `sample_rate` and `streaming` are fixed at construction: they are baked into
-        the capabilities the agent session already negotiated.
-        """
+        """Apply to requests made from here on; `sample_rate` and `streaming` are fixed."""
         if is_given(voice_id):
             self._opts.voice_id = voice_id
         if is_given(model):
@@ -248,13 +263,21 @@ class TTS(tts.TTS):
         return await self._get("/models")
 
     async def _get(self, path: str) -> list[dict[str, Any]]:
-        async with self._ensure_session().get(
-            f"{self._opts.base_url}{path}",
-            headers={AUTH_HEADER: self._opts.api_key},
-            ssl=self._opts.ssl,
-        ) as res:
-            await _raise_for_status(res, path)
-            return await res.json()
+        try:
+            async with self._ensure_session().get(
+                f"{self._opts.base_url}{path}",
+                headers={AUTH_HEADER: self._opts.api_key},
+                timeout=_timeout(DEFAULT_API_CONNECT_OPTIONS),
+                ssl=self._opts.ssl,
+            ) as res:
+                await _raise_for_status(res, path)
+                return await res.json()
+        except APIStatusError:
+            raise
+        except asyncio.TimeoutError:
+            raise APITimeoutError() from None
+        except Exception as e:
+            raise APIConnectionError() from e
 
     def synthesize(
         self, text: str, *, conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS
@@ -276,12 +299,7 @@ class TTS(tts.TTS):
 
 
 class ChunkedStream(tts.ChunkedStream):
-    """One request for the whole text.
-
-    With `streaming=True` the body is read as it arrives (raw PCM16), so the first
-    frame is emitted long before generation finishes; with `streaming=False` Munsit
-    answers with a complete WAV instead.
-    """
+    """One request for the whole text: PCM16 read as it arrives, or a WAV if not streaming."""
 
     def __init__(self, *, tts: TTS, input_text: str, conn_options: APIConnectOptions) -> None:
         super().__init__(tts=tts, input_text=input_text, conn_options=conn_options)
@@ -308,7 +326,8 @@ class ChunkedStream(tts.ChunkedStream):
                     mime_type="audio/pcm" if self._opts.streaming else "audio/wav",
                 )
 
-                async for data, _ in res.content.iter_chunks():
+                body = _pcm_samples(res) if self._opts.streaming else res.content.iter_any()
+                async for data in body:
                     output_emitter.push(data)
 
                 output_emitter.flush()
@@ -325,12 +344,10 @@ class ChunkedStream(tts.ChunkedStream):
 
 
 class SynthesizeStream(tts.SynthesizeStream):
-    """Incremental text in, audio out.
+    """One request per sentence, in order, like the framework's `StreamAdapter`.
 
-    Munsit's streaming endpoint is plain chunked HTTP with no incremental input, so
-    text is tokenized into sentences and each one is its own request, read as raw
-    PCM16 and pushed into the same segment. Requests are issued in order: the
-    emitter concatenates bytes, so overlapping them would interleave the audio.
+    Munsit takes no incremental text, so each sentence is its own chunked PCM16
+    request, and its text is pushed as a timed transcript where its audio starts.
     """
 
     def __init__(self, *, tts: TTS, conn_options: APIConnectOptions) -> None:
@@ -361,11 +378,19 @@ class SynthesizeStream(tts.SynthesizeStream):
             sent_stream.end_input()
 
         async def _synthesize() -> None:
+            duration = 0.0
             async for ev in sent_stream:
-                if not ev.token.strip():
+                # the transcript keeps the whitespace; Munsit gets it stripped
+                if not (text := ev.token.strip()):
                     continue
                 self._mark_started()
-                await self._synthesize_sentence(ev.token, request_id, output_emitter)
+                timed = TimedString(text=ev.token, start_time=duration)
+                output_emitter.push_timed_transcript(timed)
+                duration += await self._synthesize_sentence(
+                    text, request_id, output_emitter, retry=duration > 0
+                )
+                # play this sentence's tail now, as Speechify and StreamAdapter do
+                output_emitter.flush()
 
         tasks = [
             asyncio.create_task(_tokenize_input()),
@@ -373,7 +398,7 @@ class SynthesizeStream(tts.SynthesizeStream):
         ]
         try:
             await asyncio.gather(*tasks)
-        except (APIStatusError, APIConnectionError, APITimeoutError):
+        except APIError:
             raise
         except asyncio.TimeoutError:
             raise APITimeoutError() from None
@@ -384,17 +409,48 @@ class SynthesizeStream(tts.SynthesizeStream):
             await sent_stream.aclose()
 
     async def _synthesize_sentence(
-        self, text: str, request_id: str, output_emitter: tts.AudioEmitter
-    ) -> None:
-        async with self._tts._ensure_session().post(
-            self._opts.synthesize_url,
-            headers=self._opts.headers,
-            json=self._opts.payload(text, streaming=True),
-            timeout=_timeout(self._conn_options),
-            ssl=self._opts.ssl,
-        ) as res:
-            await _raise_for_status(res, request_id)
+        self, text: str, request_id: str, output_emitter: tts.AudioEmitter, *, retry: bool
+    ) -> float:
+        """Stream one sentence into the emitter and return its duration in seconds.
 
-            logger.debug("munsit tts sentence started", extra={"request_id": request_id})
-            async for data, _ in res.content.iter_chunks():
-                output_emitter.push(data)
+        Once audio has played the framework no longer retries, so with `retry` a failed
+        sentence is re-requested while it has pushed nothing (the Soniox plugin's rule).
+        """
+        pushed = 0
+        attempt = 0
+        while True:
+            try:
+                async with self._tts._ensure_session().post(
+                    self._opts.synthesize_url,
+                    headers=self._opts.headers,
+                    json=self._opts.payload(text, streaming=True),
+                    timeout=_timeout(self._conn_options),
+                    ssl=self._opts.ssl,
+                ) as res:
+                    await _raise_for_status(res, request_id)
+
+                    logger.debug("munsit tts sentence started", extra={"request_id": request_id})
+                    async for data in _pcm_samples(res):
+                        output_emitter.push(data)
+                        pushed += len(data)
+
+                return pushed / (self._opts.sample_rate * BYTES_PER_SAMPLE)
+            except (APIError, asyncio.TimeoutError, aiohttp.ClientError) as e:
+                retryable = e.retryable if isinstance(e, APIError) else True
+                if not (
+                    retry
+                    and retryable
+                    and pushed == 0
+                    and attempt < self._conn_options.max_retry
+                ):
+                    raise  # _run maps it to an APIError
+
+                interval = self._conn_options._interval_for_retry(attempt)
+                logger.warning(
+                    "munsit tts sentence failed: %s, retrying in %ss",
+                    e,
+                    interval,
+                    extra={"request_id": request_id, "attempt": attempt + 1},
+                )
+                await asyncio.sleep(interval)
+                attempt += 1
